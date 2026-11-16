@@ -1093,6 +1093,12 @@ enum StorageTools {
 
 // MARK: - iNotch data: AI usage limits and agent sessions
 
+// Which coding agents are on this Mac. Each keeps its own folder in your home folder once it has been used.
+enum AgentTools {
+    static var claude: Bool { FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.claude") }
+    static var codex: Bool { FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.codex") }
+}
+
 struct QuotaWindow {
     var used: Double        // 0...1
     var resetsAt: Date?
@@ -5883,35 +5889,36 @@ final class NotchView: NSView {
     }
 }
 
-// The open panel: Agents, Limits and Prompter pages.
+// The open panel. Agents and Limits only appear when Claude Code or Codex is on this Mac.
 final class NotchContent: NSView {
     override var isFlipped: Bool { true }
-    let tabs = ModeBar(titles: [L("Now", "Nu"), L("Agents", "Agents"), L("Limits", "Limieten"), L("Shelf", "Plank"),
-                                L("Prompter", "Prompter")])
+    private var tabs = ModeBar(titles: [])
     let now = NowPage()
     let agents = AgentsPage()
     let usage = UsagePage()
     let shelf = ShelfPage()
     let prompter = PrompterPage()
     private(set) var page = 0
+    private var pages: [NSView] = []
     var onPage: () -> Void = {}
+
+    var current: NSView? { page < pages.count ? pages[page] : nil }
 
     // Height of the open panel's content for the current page.
     var preferredHeight: CGFloat {
-        switch page {
-        case 0: return 44 + now.preferredHeight
-        case 1: return 44 + max(100, CGFloat(agents.count) * 46 + 4) + 36
-        case 2: return 44 + 256
-        case 3: return 44 + shelf.preferredHeight
+        switch current {
+        case now: return 44 + now.preferredHeight
+        case agents: return 44 + max(100, CGFloat(agents.count) * 46 + 4) + 36
+        case usage: return 44 + 256
+        case shelf: return 44 + shelf.preferredHeight
         default: return 44 + 162
         }
     }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        tabs.onSelect = { [weak self] in self?.show($0) }
-        for view in [tabs, now, agents, usage, shelf, prompter] as [NSView] { addSubview(view) }
-        show(0)
+        for view in [now, agents, usage, shelf, prompter] as [NSView] { addSubview(view) }
+        configure(agents: true)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -5920,9 +5927,27 @@ final class NotchContent: NSView {
     override func mouseDown(with event: NSEvent) {}
     override func mouseUp(with event: NSEvent) {}
 
+    // Shows or hides the Agents and Limits tabs; keeps the page you were on when it still exists.
+    func configure(agents showAgents: Bool) {
+        let next: [NSView] = showAgents ? [now, agents, usage, shelf, prompter] : [now, shelf, prompter]
+        guard next != pages else { return }
+        let previous = current
+        pages = next
+        var titles: [String] = [L("Now", "Nu")]
+        if showAgents { titles += [L("Agents", "Agents"), L("Limits", "Limieten")] }
+        titles += [L("Shelf", "Plank"), L("Prompter", "Prompter")]
+        tabs.removeFromSuperview()
+        tabs = ModeBar(titles: titles)
+        tabs.onSelect = { [weak self] in self?.show($0) }
+        addSubview(tabs)
+        let index = previous.flatMap { next.firstIndex(of: $0) } ?? 0
+        tabs.select(index)
+        needsLayout = true
+    }
+
     func show(_ index: Int) {
         page = index
-        for (number, view) in pages.enumerated() { view.isHidden = number != index }
+        for view in [now, agents, usage, shelf, prompter] as [NSView] { view.isHidden = view !== current }
         onPage()
     }
 
@@ -5930,10 +5955,8 @@ final class NotchContent: NSView {
         super.layout()
         tabs.frame = NSRect(x: -Metrics.inset + 2, y: 0, width: bounds.width + Metrics.inset * 2 - 4, height: 36)
         let page = NSRect(x: 0, y: 44, width: bounds.width, height: max(0, bounds.height - 44))
-        for view in pages { view.frame = page }
+        for view in [now, agents, usage, shelf, prompter] as [NSView] { view.frame = page }
     }
-
-    private var pages: [NSView] { [now, agents, usage, shelf, prompter] }
 }
 
 final class AgentsPage: NSView {
@@ -5955,7 +5978,9 @@ final class AgentsPage: NSView {
         addSubview(hookLabel)
     }
 
-    func showHook(installed: Bool) {
+    func showHook(installed: Bool, available: Bool) {
+        hookButton.isHidden = !available
+        hookLabel.isHidden = !available
         hookButton.title.stringValue = installed ? L("Turn off", "Uitzetten") : L("Approve from the notch", "Goedkeuren vanuit de notch")
         hookLabel.stringValue = installed
             ? L("Claude Code asks for permission here", "Claude Code vraagt hier om toestemming")
@@ -6030,6 +6055,7 @@ final class UsagePage: NSView {
     var onRefresh: () -> Void = {}
     private var providers: [ProviderUsage] = []
     private var claudeConnected = false
+    private var names: [String] = []
     private lazy var connect = AccentButton { [weak self] in self?.onConnectClaude() }
     private lazy var refresh = IconButton(symbol: "arrow.clockwise", help: L("Refresh", "Vernieuwen")) { [weak self] in self?.onRefresh() }
     private let footer = makeLabel("", size: 10.5, weight: .regular, color: NSColor.white.withAlphaComponent(0.5))
@@ -6042,11 +6068,12 @@ final class UsagePage: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(_ providers: [ProviderUsage], claudeConnected: Bool, updated: Date?) {
+    func show(_ providers: [ProviderUsage], names: [String], claudeConnected: Bool, updated: Date?) {
         self.providers = providers
+        self.names = names
         self.claudeConnected = claudeConnected
-        connect.isHidden = claudeConnected
-        footer.stringValue = claudeConnected
+        connect.isHidden = claudeConnected || !names.contains("Claude")
+        footer.stringValue = claudeConnected || !names.contains("Claude")
             ? updated.map { L("Updated", "Bijgewerkt") + " " + NotchFormat.ago($0) } ?? L("Not loaded yet", "Nog niet geladen")
             : L("Claude limits need your Claude Code sign-in from the Keychain", "Claude-limieten gebruiken je Claude Code-inlog uit de sleutelhanger")
         needsLayout = true
@@ -6056,14 +6083,15 @@ final class UsagePage: NSView {
     override func layout() {
         super.layout()
         let width = connect.preferredWidth
-        connect.frame = NSRect(x: bounds.width / 4 - width / 2, y: 70, width: width, height: 28)
+        let columnCenter = names.count == 1 ? bounds.width / 2 : bounds.width / 4
+        connect.frame = NSRect(x: columnCenter - width / 2, y: 70, width: width, height: 28)
         refresh.frame = NSRect(x: bounds.width - 26, y: bounds.height - 26, width: 26, height: 24)
         footer.frame = NSRect(x: 2, y: bounds.height - 22, width: bounds.width - 34, height: 14)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let column = (bounds.width - 12) / 2
-        for (index, name) in ["Claude", "Codex"].enumerated() {
+        let column = names.count == 1 ? bounds.width : (bounds.width - 12) / 2
+        for (index, name) in names.enumerated() {
             let x = CGFloat(index) * (column + 12)
             let box = NSRect(x: x, y: 0, width: column, height: bounds.height - 34)
             NSColor.white.withAlphaComponent(0.07).setFill()
@@ -7323,7 +7351,7 @@ final class NotchController {
         shelf.prune()
         showShelf()
         showNow()
-        view.content.agents.showHook(installed: ClaudeHook.installed)
+        applyTools()
         lastPower = PowerInfo.sample()
         scanAgents()
         refreshUsage()
@@ -7527,7 +7555,7 @@ final class NotchController {
             failure.informativeText = error
             failure.runModal()
         }
-        view.content.agents.showHook(installed: ClaudeHook.installed)
+        view.content.agents.showHook(installed: ClaudeHook.installed, available: AgentTools.claude)
     }
 
     // MARK: Alerts
@@ -7613,7 +7641,19 @@ final class NotchController {
 
     // MARK: Agents
 
+    // Claude Code or Codex can be installed while iServer runs; the panel follows along.
+    private func applyTools() {
+        let claude = AgentTools.claude, codex = AgentTools.codex
+        view.content.configure(agents: claude || codex || demo)
+        view.content.agents.showHook(installed: claude && ClaudeHook.installed, available: claude)
+        if !claude { usage.removeAll { $0.name == "Claude" } }
+        if !codex { usage.removeAll { $0.name == "Codex" } }
+        showUsage()
+        view.refit()
+    }
+
     private func scanAgents() {
+        applyTools()
         guard !scanning else { return }
         scanning = true
         let demo = self.demo
@@ -7779,10 +7819,12 @@ final class NotchController {
             AIUsage.demo().forEach(merge)
             return
         }
-        let claude = claudeConnected
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let codex = AIUsage.codex()
-            DispatchQueue.main.async { self?.merge(codex) }
+        let claude = claudeConnected && AgentTools.claude
+        if AgentTools.codex {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let codex = AIUsage.codex()
+                DispatchQueue.main.async { self?.merge(codex) }
+            }
         }
         guard claude else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -7808,7 +7850,8 @@ final class NotchController {
     }
 
     private func showUsage() {
-        view.content.usage.show(usage, claudeConnected: claudeConnected || demo, updated: usageUpdated)
+        let names = demo ? ["Claude", "Codex"] : [AgentTools.claude ? "Claude" : nil, AgentTools.codex ? "Codex" : nil].compactMap { $0 }
+        view.content.usage.show(usage, names: names, claudeConnected: claudeConnected || demo, updated: usageUpdated)
     }
 
     private func showPrompter() {
