@@ -2295,6 +2295,14 @@ final class IconButton: HoverView {
     private var symbolName: String
     private let destructive: Bool
 
+    var symbol: String {
+        get { symbolName }
+        set {
+            symbolName = newValue
+            needsDisplay = true
+        }
+    }
+
     init(symbol: String, help: String, destructive: Bool = false, action: @escaping () -> Void) {
         symbolName = symbol
         self.destructive = destructive
@@ -5225,6 +5233,7 @@ struct Spring {
 final class Companion {
     enum Mood { case idle, happy, worried, sleepy, surprised }
     var mood = Mood.idle
+    var dancing = false  // bobs to the music while a song plays
     private var moodUntil = Date.distantPast
     private var nextBlink = Date().addingTimeInterval(2)
     private var blinkUntil = Date.distantPast
@@ -5364,7 +5373,10 @@ final class Companion {
         let now = Date()
         let size = min(rect.width, rect.height)
         let breathe = mood == .sleepy ? sin(now.timeIntervalSince(born) * 1.4) * 0.04 : sin(now.timeIntervalSince(born) * 2.2) * 0.025
-        let lift = CGFloat(max(0, hop.value)) * size / 100
+        var lift = CGFloat(max(0, hop.value)) * size / 100
+        if dancing, mood == .idle || mood == .happy {
+            lift += CGFloat(abs(sin(now.timeIntervalSince(born) * 4.2))) * size * 0.09
+        }
         let bodyW = size * 0.78
         let bodyH = size * 0.62 * (1 + breathe)
         let body = NSRect(x: rect.midX - bodyW / 2, y: rect.minY + size * 0.06 + lift, width: bodyW, height: bodyH)
@@ -5509,7 +5521,7 @@ struct NotchAlert {
 
 // Notch-shaped surface: compact around the hardware notch, wider on hover, a panel when clicked, wide for alerts.
 final class NotchView: NSView {
-    enum Mode { case hidden, compact, peek, expanded, alert, approval }
+    enum Mode { case hidden, compact, peek, expanded, alert, approval, drop }
     var mode = Mode.compact
     var notch = NSSize(width: 200, height: 32)  // the hardware cut-out (or a capsule on Macs without one)
     var hasNotch = true
@@ -5519,11 +5531,20 @@ final class NotchView: NSView {
     var claudeUsage: Double?     // 5-hour usage 0...1, shown with its mark when peeking
     var codexUsage: Double?
     var rightDot: NSColor?       // status dot in the right wing
+
+    // What the right wing shows when compact.
+    enum Wing: Equatable { case none, dot(NSColor), text(String), timer(String, Double), bars, download }
+    var rightWing = Wing.none
+    var music: NowPlaying?       // shown when peeking
+    var onDragEnter: () -> Void = {}
+    var onDragExit: () -> Void = {}
+    var onDrop: ([URL]) -> Void = { _ in }
     var alert: NotchAlert?
     let content = NotchContent()
     let card = ApprovalCard()
     // Underdamped springs overshoot a little, which gives the island its jelly feel.
     private var width = NotchView.jelly(200)
+    private var shift = NotchView.jelly(0)
     private var height = NotchView.jelly(32)
     private var radius = Spring(10)
 
@@ -5550,29 +5571,81 @@ final class NotchView: NSView {
         content.isHidden = true
         card.alphaValue = 0
         card.isHidden = true
+        registerForDraggedTypes([.fileURL])
+    }
+
+    // Files dragged onto the island go to the shelf.
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragEnter()
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) { onDragExit() }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        guard !urls.isEmpty else { return false }
+        onDrop(urls)
+        return true
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    private var wing: CGFloat { 38 }
+    private var wing: CGFloat {
+        if case .timer = rightWing { return 64 }
+        return 38
+    }
     private var hasLeft: Bool { companion != nil }
-    private var hasRight: Bool { rightDot != nil || rightText != nil }
+    private var hasRight: Bool { rightWing != .none }
+
+    // Hover width of each side: just enough for what it shows, so there is no empty black space.
+    private var peekSides: (CGFloat, CGFloat) {
+        let pip: CGFloat = companion == nil ? 14 : 42
+        let indicator: CGFloat = rightWing == .none ? 12 : 34
+        let left: CGFloat, right: CGFloat
+        if let music {
+            left = pip + 28 + min(150, Draw.width(music.title, font: termFont(11.5, .semibold))) + 14
+            right = 12 + min(130, Draw.width(music.artist, font: termFont(11.5, .medium))) + indicator
+        } else if claudeUsage != nil || codexUsage != nil {
+            let font = roundedFont(13, .bold)
+            func reading(_ value: Double?) -> CGFloat {
+                value.map { 22 + Draw.width("\(Int(($0 * 100).rounded()))%", font: font) } ?? 0
+            }
+            left = pip + reading(claudeUsage) + 12
+            right = 12 + reading(codexUsage) + indicator
+        } else {
+            left = pip + (peekLabel.map { min(170, Draw.width($0, font: termFont(11.5, .semibold))) + 14 } ?? 0)
+            right = indicator
+        }
+        return (max(38, left), max(rightWing == .none ? 0 : 38, right))
+    }
+
+    // Without usage or music, the status text sits beside Pip.
+    private var peekLabel: String? { leftText ?? rightText }
 
     // Size of the black shape for each mode.
-    private func target(_ mode: Mode) -> (CGFloat, CGFloat, CGFloat) {
+    // (width, height, corner radius, horizontal shift). Each side grows on its own, so the shape can be off-centre.
+    private func target(_ mode: Mode) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
         let base = notch.width
         let corner: CGFloat = hasNotch ? 10 : notch.height / 2
+        func sides(_ left: CGFloat, _ right: CGFloat, _ height: CGFloat, _ radius: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+            (base + left + right, height, radius, (right - left) / 2)
+        }
         switch mode {
-        case .hidden: return (base, notch.height, corner)
-        case .compact:
-            let extra = (hasLeft || hasRight) ? wing * 2 : 0
-            return (base + extra, notch.height, corner)
-        case .peek: return (base + 260, notch.height + 4, hasNotch ? 14 : (notch.height + 4) / 2)
-        case .alert: return (base + 330, notch.height + 6, hasNotch ? 16 : (notch.height + 6) / 2)
-        case .expanded: return (max(520, base + 300), notch.height + 18 + content.preferredHeight, 26)
-        case .approval: return (max(520, base + 300), notch.height + 112, 26)
+        case .hidden: return (base, notch.height, corner, 0)
+        case .compact: return sides(hasLeft ? 38 : 0, hasRight ? wing : 0, notch.height, corner)
+        case .peek:
+            let (left, right) = peekSides
+            return sides(left, right, notch.height + 4, hasNotch ? 14 : (notch.height + 4) / 2)
+        case .alert: return (base + 330, notch.height + 6, hasNotch ? 16 : (notch.height + 6) / 2, 0)
+        case .expanded: return (max(520, base + 300), notch.height + 18 + content.preferredHeight, 26, 0)
+        case .approval: return (max(520, base + 300), notch.height + 112, 26, 0)
+        case .drop: return (max(460, base + 260), notch.height + 120, 26, 0)
         }
     }
+
 
     // Re-target the open panel's height, e.g. after switching pages.
     func refit() {
@@ -5582,7 +5655,8 @@ final class NotchView: NSView {
 
     func setMode(_ next: Mode) {
         mode = next
-        let (w, h, r) = target(next)
+        let (w, h, r, x) = target(next)
+        shift.target = Double(x)
         width.target = Double(w)
         height.target = Double(h)
         radius.target = Double(r)
@@ -5590,7 +5664,7 @@ final class NotchView: NSView {
         card.isHidden = false
         Animator.shared.run(self) { [weak self] in
             guard let self else { return false }
-            let moving = [self.width.step(), self.height.step(), self.radius.step()].contains(true)
+            let moving = [self.width.step(), self.height.step(), self.radius.step(), self.shift.step()].contains(true)
             self.needsLayout = true
             self.needsDisplay = true
             if !moving, self.mode != .expanded { self.content.isHidden = true }
@@ -5601,7 +5675,8 @@ final class NotchView: NSView {
 
     // Snap to the current mode without animating (first show, screen change).
     func settle() {
-        let (w, h, r) = target(mode)
+        let (w, h, r, x) = target(mode)
+        shift = NotchView.jelly(Double(x))
         width = NotchView.jelly(Double(w))
         height = NotchView.jelly(Double(h))
         radius = Spring(Double(r))
@@ -5616,7 +5691,7 @@ final class NotchView: NSView {
         let wide = CGFloat(max(-0.02, min(0.02, width.velocity / 8000)))
         let w = CGFloat(width.value) * (1 - tall * 0.6 + wide * 0.2)
         let h = max(notch.height, CGFloat(height.value) * (1 - wide * 0.5 + tall * 0.2))
-        return NSRect(x: bounds.midX - w / 2, y: bounds.maxY - h, width: w, height: h)
+        return NSRect(x: bounds.midX + CGFloat(shift.value) - w / 2, y: bounds.maxY - h, width: w, height: h)
     }
 
     // Square top flush with the screen edge, small flared "ears", rounded bottom.
@@ -5698,14 +5773,30 @@ final class NotchView: NSView {
                          color: NSColor.white.withAlphaComponent(0.6))
             }
         case .compact, .peek, .hidden:
-            let wingWidth = (band.width - notch.width) / 2
-            guard wingWidth > 12 else { break }
-            if let companion {
+            let notchLeft = bounds.midX - notch.width / 2, notchRight = bounds.midX + notch.width / 2
+            let leftWidth = notchLeft - band.minX, rightWidth = band.maxX - notchRight
+            let wingWidth = leftWidth
+            if let companion, leftWidth > 12 {
                 let side = min(band.height - 4, 30)
-                companion.draw(in: NSRect(x: band.minX + max(4, (min(wingWidth, wing) - side) / 2), y: band.minY + 2,
+                companion.draw(in: NSRect(x: band.minX + max(4, (min(leftWidth, 38) - side) / 2), y: band.minY + 2,
                                           width: side, height: side), look: look)
             }
-            if mode == .peek, claudeUsage != nil || codexUsage != nil, wingWidth > 90 {
+            if mode == .peek, let music, wingWidth > 60 {
+                // Now playing: cover and title on the left, the right wing keeps its live status
+                let art = NSRect(x: band.minX + 40, y: band.midY - 10, width: 20, height: 20)
+                if let artwork = music.artwork {
+                    NSGraphicsContext.saveGraphicsState()
+                    NSBezierPath(roundedRect: art, xRadius: 5, yRadius: 5).addClip()
+                    artwork.draw(in: art)
+                    NSGraphicsContext.restoreGraphicsState()
+                } else {
+                    drawSymbol("music.note", in: art, pointSize: 13, weight: .semibold, color: .systemPink)
+                }
+                drawLine(music.title, at: NSPoint(x: art.maxX + 8, y: band.midY - 7), width: notchLeft - art.maxX - 16,
+                         font: termFont(11.5, .semibold), color: .white)
+                drawLine(music.artist, at: NSPoint(x: notchRight + 12, y: band.midY - 7), width: rightWidth - 46,
+                         font: termFont(11.5, .medium), color: NSColor.white.withAlphaComponent(0.6))
+            } else if mode == .peek, claudeUsage != nil || codexUsage != nil, wingWidth > 30 {
                 // Like codex-island: each provider's mark and its 5-hour percentage, one on each side.
                 let font = roundedFont(13, .bold)
                 if let claudeUsage {
@@ -5715,29 +5806,29 @@ final class NotchView: NSView {
                               at: NSPoint(x: mark.maxX + 6, y: band.midY - 8))
                 }
                 if let codexUsage {
-                    let mark = NSRect(x: band.midX + notch.width / 2 + 12, y: band.midY - 8, width: 16, height: 16)
+                    let mark = NSRect(x: notchRight + 12, y: band.midY - 8, width: 16, height: 16)
                     ProviderMark.draw("Codex", in: mark)
                     Draw.text("\(Int((codexUsage * 100).rounded()))%", font: font, color: Draw.level(codexUsage, .white),
                               at: NSPoint(x: mark.maxX + 6, y: band.midY - 8))
                 }
-            } else if mode == .peek {
-                if let leftText, wingWidth > 90 {
-                    drawLine(leftText, at: NSPoint(x: band.minX + 42, y: band.midY - 7), width: wingWidth - 50,
-                             font: termFont(11.5, .semibold), color: .white)
-                }
-                if let rightText, wingWidth > 90 {
-                    drawLine(rightText, at: NSPoint(x: band.midX + notch.width / 2 + 10, y: band.midY - 7), width: wingWidth - 34,
-                             font: termFont(11.5, .semibold), color: NSColor.white.withAlphaComponent(0.85))
-                }
+            } else if mode == .peek, let label = peekLabel, wingWidth > 60 {
+                drawLine(label, at: NSPoint(x: band.minX + 42, y: band.midY - 7), width: notchLeft - band.minX - 50,
+                         font: termFont(11.5, .semibold), color: .white)
             }
-            if let rightDot {
-                let dot = NSRect(x: band.maxX - min(wingWidth, wing) / 2 - 4, y: band.midY - 4, width: 8, height: 8)
-                rightDot.setFill()
-                NSBezierPath(ovalIn: dot).fill()
-            } else if let rightText, mode == .compact {
-                let font = roundedFont(11, .bold)
-                let w = Draw.width(rightText, font: font)
-                Draw.text(rightText, font: font, color: .white, at: NSPoint(x: band.maxX - min(wingWidth, wing) / 2 - w / 2, y: band.midY - 7))
+            if rightWidth > 12 { drawRightWing(in: band, wingWidth: rightWidth) }
+        case .drop:
+            let zone = NSRect(x: rect.minX + 18, y: rect.minY + 14, width: rect.width - 36, height: rect.height - notch.height - 24)
+            let dashed = NSBezierPath(roundedRect: zone, xRadius: 16, yRadius: 16)
+            dashed.setLineDash([7, 5], count: 2, phase: 0)
+            dashed.lineWidth = 2
+            NSColor.white.withAlphaComponent(0.45).setStroke()
+            dashed.stroke()
+            drawSymbol("tray.and.arrow.down.fill", in: NSRect(x: zone.midX - 14, y: zone.midY + 2, width: 28, height: 28), pointSize: 22,
+                       weight: .semibold, color: .white)
+            Draw.text(L("Drop to keep on the shelf", "Loslaten om op de plank te leggen"), font: termFont(12.5, .semibold),
+                      color: .white, centeredAt: NSPoint(x: zone.midX, y: zone.midY - 16))
+            if let companion {
+                companion.draw(in: NSRect(x: band.minX + 16, y: band.minY + 2, width: band.height - 4, height: band.height - 4), look: look)
             }
         case .expanded, .approval:
             if let companion {
@@ -5756,14 +5847,51 @@ final class NotchView: NSView {
         (text as NSString).draw(with: NSRect(x: point.x, y: point.y, width: width, height: font.pointSize + 4),
                                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
     }
+
+    // The right wing: a status dot, a timer, music bars, a download arrow or a usage figure.
+    private func drawRightWing(in band: NSRect, wingWidth: CGFloat) {
+        let width = min(wingWidth, wing)
+        let center = NSPoint(x: band.maxX - width / 2, y: band.midY)
+        let t = Date().timeIntervalSinceReferenceDate
+        switch rightWing {
+        case .none:
+            break
+        case .dot(let color):
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8)).fill()
+        case .text(let text):
+            guard mode == .compact else { break }
+            let font = roundedFont(11, .bold)
+            Draw.text(text, font: font, color: .white, at: NSPoint(x: center.x - Draw.width(text, font: font) / 2, y: center.y - 7))
+        case .timer(let text, let fraction):
+            let ring = NSPoint(x: band.maxX - width + 14, y: center.y)
+            Draw.ring(center: ring, radius: 7, width: 2.5, fraction: fraction, tint: .systemOrange)
+            Draw.text(text, font: roundedFont(11.5, .bold), color: .systemOrange, at: NSPoint(x: ring.x + 12, y: center.y - 7.5))
+        case .bars:
+            // A small equaliser
+            NSColor.systemPink.setFill()
+            for index in 0..<4 {
+                let height = 4 + CGFloat(abs(sin(t * (5 + Double(index) * 1.7) + Double(index)))) * 10
+                let bar = NSRect(x: center.x - 9 + CGFloat(index) * 5, y: center.y - height / 2, width: 3, height: height)
+                NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
+            }
+        case .download:
+            let pulse = 0.6 + 0.4 * abs(sin(t * 3))
+            drawSymbol("arrow.down.circle", in: NSRect(x: center.x - 8, y: center.y - 8, width: 16, height: 16), pointSize: 13,
+                       weight: .semibold, color: NSColor.systemBlue.withAlphaComponent(CGFloat(pulse)))
+        }
+    }
 }
 
 // The open panel: Agents, Limits and Prompter pages.
 final class NotchContent: NSView {
     override var isFlipped: Bool { true }
-    let tabs = ModeBar(titles: [L("Agents", "Agents"), L("Limits", "Limieten"), L("Prompter", "Prompter")])
+    let tabs = ModeBar(titles: [L("Now", "Nu"), L("Agents", "Agents"), L("Limits", "Limieten"), L("Shelf", "Plank"),
+                                L("Prompter", "Prompter")])
+    let now = NowPage()
     let agents = AgentsPage()
     let usage = UsagePage()
+    let shelf = ShelfPage()
     let prompter = PrompterPage()
     private(set) var page = 0
     var onPage: () -> Void = {}
@@ -5771,8 +5899,10 @@ final class NotchContent: NSView {
     // Height of the open panel's content for the current page.
     var preferredHeight: CGFloat {
         switch page {
-        case 0: return 44 + max(100, CGFloat(agents.count) * 46 + 4) + 36
-        case 1: return 44 + 256
+        case 0: return 44 + now.preferredHeight
+        case 1: return 44 + max(100, CGFloat(agents.count) * 46 + 4) + 36
+        case 2: return 44 + 256
+        case 3: return 44 + shelf.preferredHeight
         default: return 44 + 162
         }
     }
@@ -5780,7 +5910,7 @@ final class NotchContent: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         tabs.onSelect = { [weak self] in self?.show($0) }
-        for view in [tabs, agents, usage, prompter] as [NSView] { addSubview(view) }
+        for view in [tabs, now, agents, usage, shelf, prompter] as [NSView] { addSubview(view) }
         show(0)
     }
 
@@ -5792,9 +5922,7 @@ final class NotchContent: NSView {
 
     func show(_ index: Int) {
         page = index
-        agents.isHidden = index != 0
-        usage.isHidden = index != 1
-        prompter.isHidden = index != 2
+        for (number, view) in pages.enumerated() { view.isHidden = number != index }
         onPage()
     }
 
@@ -5802,8 +5930,10 @@ final class NotchContent: NSView {
         super.layout()
         tabs.frame = NSRect(x: -Metrics.inset + 2, y: 0, width: bounds.width + Metrics.inset * 2 - 4, height: 36)
         let page = NSRect(x: 0, y: 44, width: bounds.width, height: max(0, bounds.height - 44))
-        for view in [agents, usage, prompter] as [NSView] { view.frame = page }
+        for view in pages { view.frame = page }
     }
+
+    private var pages: [NSView] { [now, agents, usage, shelf, prompter] }
 }
 
 final class AgentsPage: NSView {
@@ -6080,6 +6210,314 @@ enum NotchFormat {
     }
 }
 
+// The "Now" page: what's playing, a timer, and downloads in progress.
+final class NowPage: NSView {
+    override var isFlipped: Bool { true }
+    var onMusic: (String) -> Void = { _ in }       // "playpause", "next track", "previous track"
+    var onTimer: (Double) -> Void = { _ in }       // start with minutes
+    var onTimerPause: () -> Void = {}
+    var onTimerStop: () -> Void = {}
+    var music: NowPlaying?
+    var timer: NotchTimer?
+    var downloads: [DownloadItem] = []
+    private lazy var previous = IconButton(symbol: "backward.fill", help: L("Previous", "Vorige")) { [weak self] in self?.onMusic("previous track") }
+    private lazy var play = IconButton(symbol: "play.fill", help: L("Play/pause", "Afspelen/pauze")) { [weak self] in self?.onMusic("playpause") }
+    private lazy var next = IconButton(symbol: "forward.fill", help: L("Next", "Volgende")) { [weak self] in self?.onMusic("next track") }
+    private lazy var pause = IconButton(symbol: "pause.fill", help: L("Pause/resume", "Pauze/verder")) { [weak self] in self?.onTimerPause() }
+    private lazy var stop = IconButton(symbol: "xmark", help: L("Stop timer", "Timer stoppen")) { [weak self] in self?.onTimerStop() }
+    private var presets: [SortChip] = []
+    private static let minutes: [Double] = [1, 5, 10, 15, 25, 45]
+
+    static let musicHeight: CGFloat = 96
+    static let timerHeight: CGFloat = 66
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        for view in [previous, play, next, pause, stop] as [NSView] { addSubview(view) }
+        for minutes in NowPage.minutes {
+            let chip = SortChip("\(Int(minutes))m")
+            chip.onClick = { [weak self] in self?.onTimer(minutes) }
+            presets.append(chip)
+            addSubview(chip)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+
+    var preferredHeight: CGFloat {
+        NowPage.musicHeight + 8 + NowPage.timerHeight + (downloads.isEmpty ? 0 : 8 + CGFloat(downloads.count) * 34)
+    }
+
+    func refresh() {
+        let hasMusic = music != nil
+        for button in [previous, play, next] { button.isHidden = !hasMusic }
+        play.symbol = music?.playing == true ? "pause.fill" : "play.fill"
+        let running = timer?.running == true
+        pause.isHidden = !running
+        stop.isHidden = !running
+        pause.symbol = timer?.paused != nil ? "play.fill" : "pause.fill"
+        presets.forEach { $0.isHidden = running }
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        let musicBox = NSRect(x: 0, y: 0, width: bounds.width, height: NowPage.musicHeight)
+        var x = musicBox.maxX - 14 - 28
+        for button in [next, play, previous] {
+            button.frame = NSRect(x: x, y: musicBox.midY - 14, width: 28, height: 28)
+            x -= 32
+        }
+        let timerBox = NSRect(x: 0, y: musicBox.maxY + 8, width: bounds.width, height: NowPage.timerHeight)
+        stop.frame = NSRect(x: timerBox.maxX - 14 - 28, y: timerBox.midY - 14, width: 28, height: 28)
+        pause.frame = NSRect(x: stop.frame.minX - 32, y: timerBox.midY - 14, width: 28, height: 28)
+        var chipX = timerBox.maxX - 12
+        for chip in presets.reversed() {
+            let width: CGFloat = 44
+            chipX -= width
+            chip.frame = NSRect(x: chipX, y: timerBox.midY - 12, width: width, height: 24)
+            chipX -= 4
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let dim = NSColor.white.withAlphaComponent(0.55)
+        // Music
+        let musicBox = NSRect(x: 0, y: 0, width: bounds.width, height: NowPage.musicHeight)
+        NSColor.white.withAlphaComponent(0.07).setFill()
+        NSBezierPath(roundedRect: musicBox, xRadius: 16, yRadius: 16).fill()
+        let art = NSRect(x: musicBox.minX + 12, y: musicBox.minY + 12, width: 72, height: 72)
+        if let music {
+            if let artwork = music.artwork {
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(roundedRect: art, xRadius: 12, yRadius: 12).addClip()
+                artwork.draw(in: art, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+                NSGraphicsContext.restoreGraphicsState()
+            } else {
+                Draw.tile("music.note", in: art, color: .systemPink)
+            }
+            let textX = art.maxX + 14
+            let textWidth = previous.frame.minX - 10 - textX
+            drawLine(music.title, at: NSPoint(x: textX, y: musicBox.minY + 16), width: textWidth, font: termFont(13.5, .semibold), color: .white)
+            drawLine(music.artist + "  ·  " + music.app, at: NSPoint(x: textX, y: musicBox.minY + 36), width: textWidth,
+                     font: termFont(11.5, .regular), color: dim)
+            if music.duration > 0 {
+                let bar = NSRect(x: textX, y: musicBox.minY + 66, width: textWidth, height: 4)
+                NSColor.white.withAlphaComponent(0.15).setFill()
+                NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
+                var filled = bar
+                filled.size.width = bar.width * CGFloat(music.elapsed / music.duration)
+                NSColor.white.setFill()
+                NSBezierPath(roundedRect: filled, xRadius: 2, yRadius: 2).fill()
+                let times = NotchTimer.text(music.elapsed) + " / " + NotchTimer.text(music.duration)
+                Draw.text(times, font: digitFont(10, .medium), color: dim, at: NSPoint(x: textX, y: musicBox.minY + 74))
+            }
+        } else {
+            Draw.tile("music.note", in: art, color: NSColor.white.withAlphaComponent(0.4))
+            drawLine(L("Nothing playing", "Er speelt niets"), at: NSPoint(x: art.maxX + 14, y: musicBox.minY + 26),
+                     width: musicBox.width - art.width - 40, font: termFont(13, .semibold), color: NSColor.white.withAlphaComponent(0.7))
+            drawLine(L("Play something in Music or Spotify", "Speel iets af in Music of Spotify"), at: NSPoint(x: art.maxX + 14, y: musicBox.minY + 46),
+                     width: musicBox.width - art.width - 40, font: termFont(11.5, .regular), color: dim)
+        }
+
+        // Timer
+        let timerBox = NSRect(x: 0, y: musicBox.maxY + 8, width: bounds.width, height: NowPage.timerHeight)
+        NSColor.white.withAlphaComponent(0.07).setFill()
+        NSBezierPath(roundedRect: timerBox, xRadius: 16, yRadius: 16).fill()
+        if let timer, timer.running {
+            let center = NSPoint(x: timerBox.minX + 36, y: timerBox.midY)
+            NSGraphicsContext.saveGraphicsState()
+            // ring() draws for non-flipped views; flip locally around the centre
+            let flip = NSAffineTransform()
+            flip.translateX(by: 0, yBy: center.y * 2)
+            flip.scaleX(by: 1, yBy: -1)
+            flip.concat()
+            Draw.ring(center: center, radius: 18, width: 5, fraction: timer.fraction, tint: .systemOrange)
+            NSGraphicsContext.restoreGraphicsState()
+            Draw.text(NotchTimer.text(timer.remaining), font: roundedFont(26, .bold), color: .white,
+                      at: NSPoint(x: timerBox.minX + 68, y: timerBox.midY - 17))
+            if timer.paused != nil {
+                Draw.text(L("paused", "gepauzeerd"), font: termFont(11, .medium), color: dim,
+                          at: NSPoint(x: timerBox.minX + 170, y: timerBox.midY - 7))
+            }
+        } else {
+            drawSymbol("timer", in: NSRect(x: timerBox.minX + 14, y: timerBox.midY - 11, width: 22, height: 22), pointSize: 16,
+                       weight: .semibold, color: .systemOrange)
+            Draw.text(L("Timer", "Timer"), font: termFont(13, .semibold), color: .white, at: NSPoint(x: timerBox.minX + 44, y: timerBox.midY - 9))
+        }
+
+        // Downloads
+        var y = timerBox.maxY + 8
+        for item in downloads {
+            let row = NSRect(x: 0, y: y, width: bounds.width, height: 30)
+            NSColor.white.withAlphaComponent(0.07).setFill()
+            NSBezierPath(roundedRect: row, xRadius: 10, yRadius: 10).fill()
+            Draw.tile("arrow.down", in: NSRect(x: row.minX + 7, y: row.minY + 4, width: 22, height: 22), color: .systemBlue)
+            drawLine(item.name, at: NSPoint(x: row.minX + 34, y: row.minY + 7), width: row.width - 130, font: termFont(12, .medium), color: .white)
+            let size = Scanner.formatBytes(item.bytes)
+            let font = digitFont(11, .medium)
+            Draw.text(size, font: font, color: dim, at: NSPoint(x: row.maxX - 12 - Draw.width(size, font: font), y: row.minY + 8))
+            y += 34
+        }
+    }
+
+    private func drawLine(_ text: String, at point: NSPoint, width: CGFloat, font: NSFont, color: NSColor) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        (text as NSString).draw(with: NSRect(x: point.x, y: point.y, width: max(10, width), height: font.pointSize + 5),
+                                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
+    }
+}
+
+// One file on the shelf; drag it out to drop it anywhere, click to show it in Finder.
+final class ShelfTile: HoverView, NSDraggingSource {
+    let url: URL
+    var onRemove: () -> Void = {}
+    var onReveal: () -> Void = {}
+    private let icon: NSImage
+    private let name: NSTextField
+    private lazy var remove = IconButton(symbol: "xmark.circle.fill", help: L("Remove from the shelf", "Van de plank halen")) { [weak self] in
+        self?.onRemove()
+    }
+    private var downAt: NSPoint?
+
+    init(url: URL) {
+        self.url = url
+        icon = NSWorkspace.shared.icon(forFile: url.path)
+        name = makeLabel(url.lastPathComponent, size: 10.5, weight: .medium, color: .white)
+        name.alignment = .center
+        name.lineBreakMode = .byTruncatingMiddle
+        name.cell?.lineBreakMode = .byTruncatingMiddle
+        super.init(frame: .zero)
+        toolTip = url.path
+        addSubview(name)
+        addSubview(remove)
+        remove.isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+
+    override func refresh() {
+        super.refresh()
+        remove.isHidden = !hovered
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !remove.isHidden, remove.frame.contains(local) { return remove }
+        return self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        downAt = event.locationInWindow
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { downAt = nil }
+        guard downAt != nil else { return }
+        super.mouseUp(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = downAt, hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) > 4 else { return }
+        downAt = nil
+        pressed = false
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        item.setDraggingFrame(NSRect(x: (bounds.width - 44) / 2, y: 6, width: 44, height: 44), contents: icon)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .outsideApplication ? [.copy, .move, .link, .generic] : []
+    }
+
+    override func layout() {
+        super.layout()
+        name.frame = NSRect(x: 2, y: 54, width: bounds.width - 4, height: 14)
+        remove.frame = NSRect(x: bounds.width - 26, y: 0, width: 24, height: 22)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered {
+            NSColor.white.withAlphaComponent(0.08).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
+        }
+        icon.draw(in: NSRect(x: (bounds.width - 44) / 2, y: 6, width: 44, height: 44), from: .zero, operation: .sourceOver,
+                  fraction: 1, respectFlipped: true, hints: nil)
+    }
+}
+
+final class ShelfPage: NSView {
+    override var isFlipped: Bool { true }
+    var onAirDrop: () -> Void = {}
+    var onClear: () -> Void = {}
+    var onRemove: (URL) -> Void = { _ in }
+    var onReveal: (URL) -> Void = { _ in }
+    private var tiles: [ShelfTile] = []
+    private let title = makeLabel("", size: 11, weight: .semibold, color: NSColor.white.withAlphaComponent(0.6))
+    private let empty = makeLabel(L("Drag files onto the notch to keep them here, then drag them out wherever you need them",
+                                    "Sleep bestanden naar de notch om ze hier te bewaren en sleep ze er later uit"),
+                                  size: 12, weight: .medium, color: NSColor.white.withAlphaComponent(0.5))
+    private lazy var airdrop = QuietButton(L("AirDrop", "AirDrop")) { [weak self] in self?.onAirDrop() }
+    private lazy var clear = QuietButton(L("Clear", "Leegmaken")) { [weak self] in self?.onClear() }
+    private static let columns = 5
+    private static let tileHeight: CGFloat = 74
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        empty.alignment = .center
+        empty.maximumNumberOfLines = 2
+        empty.cell?.usesSingleLineMode = false
+        empty.cell?.wraps = true
+        for view in [title, empty, airdrop, clear] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+
+    var preferredHeight: CGFloat {
+        tiles.isEmpty ? 90 : 36 + CGFloat((tiles.count + ShelfPage.columns - 1) / ShelfPage.columns) * (ShelfPage.tileHeight + 6)
+    }
+
+    func show(_ urls: [URL]) {
+        tiles.forEach { $0.removeFromSuperview() }
+        tiles = urls.map { url in
+            let tile = ShelfTile(url: url)
+            tile.onRemove = { [weak self] in self?.onRemove(url) }
+            tile.onClick = { [weak self] in self?.onReveal(url) }
+            return tile
+        }
+        tiles.forEach(addSubview)
+        title.stringValue = urls.count == 1 ? L("1 file", "1 bestand") : L("\(urls.count) files", "\(urls.count) bestanden")
+        for view in [title, airdrop, clear] as [NSView] { view.isHidden = urls.isEmpty }
+        empty.isHidden = !urls.isEmpty
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        empty.frame = NSRect(x: 20, y: 22, width: bounds.width - 40, height: 40)
+        title.frame = NSRect(x: 2, y: 6, width: 160, height: 14)
+        clear.frame = NSRect(x: bounds.width - 96, y: 0, width: 96, height: 26)
+        airdrop.frame = NSRect(x: clear.frame.minX - 104, y: 0, width: 96, height: 26)
+        let width = bounds.width / CGFloat(ShelfPage.columns)
+        for (index, tile) in tiles.enumerated() {
+            let row = index / ShelfPage.columns, column = index % ShelfPage.columns
+            tile.frame = NSRect(x: CGFloat(column) * width + 2, y: 36 + CGFloat(row) * (ShelfPage.tileHeight + 6),
+                                width: width - 4, height: ShelfPage.tileHeight)
+        }
+    }
+}
+
 // MARK: - iNotch: teleprompter
 
 final class PrompterView: NSView {
@@ -6211,6 +6649,281 @@ final class Prompter {
         view.fontSize = CGFloat(14 + size * 4)
         view.needsDisplay = true
         onChange()
+    }
+}
+
+// MARK: - iNotch live activities: music, shelf, timer, downloads
+
+struct NowPlaying {
+    var app: String          // "Spotify" or "Music"
+    var title: String
+    var artist: String
+    var playing: Bool
+    var position: Double     // seconds, at `stamp`
+    var duration: Double     // seconds, 0 when unknown
+    var stamp = Date()
+    var artwork: NSImage?
+
+    // Where playback is now, moving on while it plays.
+    var elapsed: Double {
+        let now = playing ? position + Date().timeIntervalSince(stamp) : position
+        return duration > 0 ? min(duration, max(0, now)) : max(0, now)
+    }
+}
+
+// Spotify and Music announce every track change and play/pause themselves; listening needs no permission.
+// Controls, artwork and the exact position use Apple events, which macOS asks you to allow once per app.
+final class MusicWatcher {
+    static let apps = [("Spotify", "com.spotify.client"), ("Music", "com.apple.Music")]
+    var onChange: (NowPlaying?) -> Void = { _ in }
+    private(set) var current: NowPlaying?
+    private var observers: [NSObjectProtocol] = []
+
+    func start() {
+        let center = DistributedNotificationCenter.default()
+        observers.append(center.addObserver(forName: Notification.Name("com.spotify.client.PlaybackStateChanged"), object: nil, queue: .main) {
+            [weak self] note in self?.received("Spotify", note.userInfo ?? [:])
+        })
+        observers.append(center.addObserver(forName: Notification.Name("com.apple.Music.playerInfo"), object: nil, queue: .main) {
+            [weak self] note in self?.received("Music", note.userInfo ?? [:])
+        })
+        // Pick up a song that was already playing, but only from apps that already allow it (no prompt now).
+        for (app, id) in MusicWatcher.apps where MusicWatcher.running(id) && MusicWatcher.allowed(id, ask: false) {
+            if let found = MusicWatcher.query(app) { update(found) }
+        }
+    }
+
+    func stop() {
+        observers.forEach { DistributedNotificationCenter.default().removeObserver($0) }
+        observers = []
+    }
+
+    static func running(_ bundleID: String) -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+    }
+
+    // Whether iServer may send Apple events to the app; with `ask` macOS shows its permission prompt.
+    static func allowed(_ bundleID: String, ask: Bool) -> Bool {
+        let target = NSAppleEventDescriptor(bundleIdentifier: bundleID)
+        guard let descriptor = target.aeDesc else { return false }
+        return AEDeterminePermissionToAutomateTarget(descriptor, typeWildCard, typeWildCard, ask) == noErr
+    }
+
+    private func received(_ app: String, _ info: [AnyHashable: Any]) {
+        let state = (info["Player State"] as? String ?? "").lowercased()
+        guard state != "stopped", let title = info["Name"] as? String else {
+            if current?.app == app { update(nil) }
+            return
+        }
+        var duration = (info["Duration"] as? NSNumber)?.doubleValue ?? 0       // Spotify, in ms
+        if duration == 0 { duration = (info["Total Time"] as? NSNumber)?.doubleValue ?? 0 }  // Music, in ms
+        var next = NowPlaying(app: app, title: title, artist: info["Artist"] as? String ?? "", playing: state == "playing",
+                              position: (info["Playback Position"] as? NSNumber)?.doubleValue ?? 0, duration: duration / 1000)
+        if let current, current.app == app, current.title == title {
+            next.artwork = current.artwork
+            if info["Playback Position"] == nil { next.position = current.elapsed }
+        }
+        update(next)
+        let bundle = MusicWatcher.apps.first { $0.0 == app }?.1 ?? ""
+        if next.artwork == nil || info["Playback Position"] == nil, MusicWatcher.allowed(bundle, ask: false) {
+            refreshDetails()
+        }
+    }
+
+    private func update(_ next: NowPlaying?) {
+        current = next
+        onChange(next)
+    }
+
+    // Exact position and artwork, when the app allows Apple events.
+    func refreshDetails() {
+        guard let app = current?.app, let fresh = MusicWatcher.query(app) else { return }
+        var next = fresh
+        if next.artwork == nil, current?.title == next.title { next.artwork = current?.artwork }
+        update(next)
+    }
+
+    // Play/pause, next or previous. The first time, macOS asks whether iServer may control the app.
+    func command(_ verb: String) {
+        let app = current?.app ?? MusicWatcher.apps.first { MusicWatcher.running($0.1) }?.0
+        guard let app, let bundle = MusicWatcher.apps.first(where: { $0.0 == app })?.1, MusicWatcher.running(bundle) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = MusicWatcher.allowed(bundle, ask: true)
+            DispatchQueue.main.async {
+                MusicWatcher.run("tell application \"\(app)\" to \(verb)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.refreshDetails() }
+            }
+        }
+    }
+
+    @discardableResult
+    static func run(_ source: String) -> NSAppleEventDescriptor? {
+        var error: NSDictionary?
+        return NSAppleScript(source: source)?.executeAndReturnError(&error)
+    }
+
+    static func query(_ app: String) -> NowPlaying? {
+        let durationExpression = app == "Spotify" ? "(duration of current track) / 1000" : "duration of current track"
+        let source = """
+            tell application "\(app)"
+                if player state is stopped then return ""
+                return (name of current track) & linefeed & (artist of current track) & linefeed & (player state as text) \
+            & linefeed & (player position as text) & linefeed & (\(durationExpression) as text)
+            end tell
+            """
+        guard let text = run(source)?.stringValue, !text.isEmpty else { return nil }
+        let parts = text.components(separatedBy: "\n")
+        guard parts.count >= 5 else { return nil }
+        func number(_ text: String) -> Double { Double(text.replacingOccurrences(of: ",", with: ".")) ?? 0 }
+        var playing = NowPlaying(app: app, title: parts[0], artist: parts[1], playing: parts[2] == "playing",
+                                 position: number(parts[3]), duration: number(parts[4]))
+        playing.artwork = artwork(app)
+        return playing
+    }
+
+    static func artwork(_ app: String) -> NSImage? {
+        if app == "Music" {
+            guard let data = run("tell application \"Music\" to get raw data of artwork 1 of current track")?.data else { return nil }
+            return NSImage(data: data)
+        }
+        guard let link = run("tell application \"Spotify\" to get artwork url of current track")?.stringValue,
+              let url = URL(string: link), url.scheme == "https" else { return nil }
+        let done = DispatchSemaphore(value: 0)
+        var image: NSImage?
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            image = data.flatMap(NSImage.init(data:))
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 4)
+        return image
+    }
+
+    static func demo() -> NowPlaying {
+        let art = NSImage(size: NSSize(width: 64, height: 64), flipped: false) { rect in
+            NSGradient(colors: [.systemPink, .systemPurple, .systemIndigo])?.draw(in: rect, angle: -45)
+            return true
+        }
+        return NowPlaying(app: "Spotify", title: "Midnight City Lights", artist: "The Night Shift", playing: true,
+                          position: 74, duration: 214, artwork: art)
+    }
+}
+
+// Files dropped on the notch, kept as references until you drag them out or clear them.
+final class Shelf {
+    private(set) var items: [URL] = []
+    var onChange: () -> Void = {}
+
+    init() {
+        items = (UserDefaults.standard.stringArray(forKey: "shelf") ?? []).map { URL(fileURLWithPath: $0) }
+        prune()
+    }
+
+    func add(_ urls: [URL]) {
+        for url in urls where !items.contains(url) { items.append(url) }
+        save()
+    }
+
+    func remove(_ url: URL) {
+        items.removeAll { $0 == url }
+        save()
+    }
+
+    func clear() {
+        items.removeAll()
+        save()
+    }
+
+    // Drops files that were moved or deleted elsewhere.
+    func prune() {
+        let before = items.count
+        items = items.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if items.count != before { save() }
+    }
+
+    private func save() {
+        UserDefaults.standard.set(items.map(\.path), forKey: "shelf")
+        onChange()
+    }
+}
+
+// A countdown that lives in the notch.
+final class NotchTimer {
+    private(set) var endsAt: Date?
+    private(set) var paused: TimeInterval?   // time left while paused
+    private(set) var total: TimeInterval = 0
+    var onFinish: () -> Void = {}
+
+    var running: Bool { endsAt != nil || paused != nil }
+
+    var remaining: TimeInterval {
+        if let paused { return paused }
+        return max(0, endsAt?.timeIntervalSinceNow ?? 0)
+    }
+
+    var fraction: Double { total > 0 ? remaining / total : 0 }
+
+    func start(minutes: Double) {
+        total = minutes * 60
+        endsAt = Date().addingTimeInterval(total)
+        paused = nil
+    }
+
+    func togglePause() {
+        if let paused {
+            endsAt = Date().addingTimeInterval(paused)
+            self.paused = nil
+        } else if endsAt != nil {
+            paused = remaining
+            endsAt = nil
+        }
+    }
+
+    func stop() {
+        endsAt = nil
+        paused = nil
+    }
+
+    func tick() {
+        guard let endsAt, endsAt <= Date() else { return }
+        stop()
+        onFinish()
+    }
+
+    static func text(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded(.up))
+        return total >= 3600 ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+            : String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+struct DownloadItem {
+    let path: String
+    let name: String
+    var bytes: UInt64
+}
+
+// Files that browsers are still writing in ~/Downloads (Safari .download, Chrome .crdownload, Firefox .part).
+enum DownloadWatcher {
+    static let suffixes = [".download", ".crdownload", ".part", ".partial"]
+
+    // Only files written to in the last two minutes; an abandoned partial file isn't a download in progress.
+    static func scan() -> [DownloadItem] {
+        DevClean.children(of: NSHomeDirectory() + "/Downloads").compactMap { path in
+            guard let suffix = suffixes.first(where: { path.hasSuffix($0) }),
+                  let modified = latestChange(path), Date().timeIntervalSince(modified) < 120 else { return nil }
+            let name = String((path as NSString).lastPathComponent.dropLast(suffix.count))
+            return DownloadItem(path: path, name: name, bytes: DevClean.allocatedSize(path))
+        }
+    }
+
+    // Safari's .download is a folder with the growing file inside, so look one level in as well.
+    static func latestChange(_ path: String) -> Date? {
+        ([path] + DevClean.children(of: path)).compactMap(AgentWatcher.modified).max()
+    }
+
+    // The finished file next to the partial one, once the browser has renamed it.
+    static func finished(_ item: DownloadItem) -> Bool {
+        FileManager.default.fileExists(atPath: (item.path as NSString).deletingLastPathComponent + "/" + item.name)
     }
 }
 
@@ -6466,6 +7179,14 @@ final class NotchController {
     private(set) var enabled = false
     private let approvals = ApprovalServer()
     private var pending: [ApprovalRequest] = []
+    private let music = MusicWatcher()
+    private var nowPlaying: NowPlaying?
+    private let shelf = Shelf()
+    private let countdown = NotchTimer()
+    private var downloads: [DownloadItem] = []
+    private var dragBoardIdle = NSPasteboard(name: .drag).changeCount
+    private var dropping = false
+    private var lastSecond = 0
 
     private var claudeConnected: Bool {
         get { UserDefaults.standard.bool(forKey: "notchClaudeUsage") }
@@ -6502,6 +7223,60 @@ final class NotchController {
         prompter.onChange = { [weak self] in self?.showPrompter() }
         view.content.agents.onHook = { [weak self] in self?.toggleHook() }
         view.card.onAnswer = { [weak self] in self?.answer($0) }
+
+        // Music
+        music.onChange = { [weak self] playing in
+            guard let self else { return }
+            let started = playing?.title != self.nowPlaying?.title && playing?.playing == true
+            self.nowPlaying = playing
+            self.companion.dancing = playing?.playing == true
+            self.showNow()
+            if started, let playing, self.view.mode != .expanded {
+                self.say(NotchAlert(symbol: "music.note", tint: .systemPink, title: playing.title, detail: playing.artist), mood: .happy)
+            }
+        }
+        let now = view.content.now
+        now.onMusic = { [weak self] in self?.music.command($0) }
+        now.onTimer = { [weak self] minutes in
+            self?.countdown.start(minutes: minutes)
+            self?.showNow()
+        }
+        now.onTimerPause = { [weak self] in
+            self?.countdown.togglePause()
+            self?.showNow()
+        }
+        now.onTimerStop = { [weak self] in
+            self?.countdown.stop()
+            self?.showNow()
+        }
+        countdown.onFinish = { [weak self] in
+            NSSound(named: "Glass")?.play()
+            self?.say(NotchAlert(symbol: "timer", tint: .systemOrange, title: L("Time's up", "De tijd is om"),
+                                 detail: L("Your timer has finished", "Je timer is afgelopen")), mood: .surprised)
+            self?.showNow()
+        }
+
+        // Shelf
+        let shelfPage = view.content.shelf
+        shelf.onChange = { [weak self] in self?.showShelf() }
+        shelfPage.onRemove = { [weak self] in self?.shelf.remove($0) }
+        shelfPage.onClear = { [weak self] in self?.shelf.clear() }
+        shelfPage.onReveal = { url in NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        shelfPage.onAirDrop = { [weak self] in
+            guard let self, !self.shelf.items.isEmpty else { return }
+            NSSharingService(named: .sendViaAirDrop)?.perform(withItems: self.shelf.items)
+        }
+        view.onDragEnter = { [weak self] in self?.startDrop() }
+        view.onDragExit = { [weak self] in self?.endDrop() }
+        view.onDrop = { [weak self] urls in
+            guard let self else { return }
+            self.shelf.add(urls)
+            self.endDrop()
+            self.say(NotchAlert(symbol: "tray.and.arrow.down.fill", tint: .systemTeal,
+                                title: urls.count == 1 ? L("On the shelf", "Op de plank") : L("\(urls.count) files on the shelf", "\(urls.count) bestanden op de plank"),
+                                detail: urls.count == 1 ? urls[0].lastPathComponent : L("Open the notch to drag them out", "Open de notch om ze eruit te slepen")),
+                     mood: .happy)
+        }
         approvals.onRequest = { [weak self] in self?.received($0) }
         approvals.onExpire = { [weak self] id in self?.expired(id) }
     }
@@ -6535,6 +7310,7 @@ final class NotchController {
         timers.append(repeating(4) { [weak self] in self?.scanAgents() })
         timers.append(repeating(600) { [weak self] in self?.refreshUsage() })
         timers.append(repeating(10) { [weak self] in self?.sampleCPU() })
+        timers.append(repeating(2) { [weak self] in self?.scanDownloads() })
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
             self?.clickedElsewhere()
         }) { monitors.append(monitor) }
@@ -6542,6 +7318,11 @@ final class NotchController {
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         watchPower()
         approvals.start()
+        music.start()
+        if demo { music.onChange(MusicWatcher.demo()) }
+        shelf.prune()
+        showShelf()
+        showNow()
         view.content.agents.showHook(installed: ClaudeHook.installed)
         lastPower = PowerInfo.sample()
         scanAgents()
@@ -6561,6 +7342,7 @@ final class NotchController {
         prompter.stop()
         approvals.stop()
         pending.removeAll()
+        music.stop()
         panel?.orderOut(nil)
         panel = nil
     }
@@ -6617,12 +7399,20 @@ final class NotchController {
         }
         // Clicks only land on the black shape; everywhere else they pass through to the menu bar and apps.
         let local = view.convert(panel.convertPoint(fromScreen: mouse), from: nil)
-        let inside = view.shapePath.contains(local)
+        let inside = view.shapePath.contains(local) || dropping
         if panel.ignoresMouseEvents == inside { panel.ignoresMouseEvents = !inside }
         let near = view.shapePath.bounds.insetBy(dx: -6, dy: -6).contains(local)
         if near != hovering {
             hovering = near
             updateMode()
+        }
+        countdown.tick()
+        watchDrag(mouse: mouse)
+        let second = Int(Date().timeIntervalSinceReferenceDate)
+        if second != lastSecond {
+            lastSecond = second
+            updateWings()
+            if view.mode == .expanded, view.content.page == 0 { view.content.now.needsDisplay = true }
         }
         if Date() > alertUntil, view.mode == .alert {
             if pending.isEmpty { nextAlert() } else { showApproval() }
@@ -6645,7 +7435,7 @@ final class NotchController {
     }
 
     private func updateMode() {
-        guard view.mode != .alert, view.mode != .expanded, view.mode != .approval else { return }
+        guard view.mode != .alert, view.mode != .expanded, view.mode != .approval, view.mode != .drop else { return }
         view.setMode(hovering ? .peek : .compact)
     }
 
@@ -6855,18 +7645,115 @@ final class NotchController {
         let working = sessions.filter { $0.state == .working }.count
         let waiting = sessions.filter { $0.state == .waiting }.count
         if waiting > 0 {
-            view.rightDot = .systemOrange
             view.rightText = "\(waiting) " + L("waiting", "wacht")
         } else if working > 0 {
-            view.rightDot = .systemBlue
             view.rightText = working == 1 ? L("1 agent working", "1 agent bezig") : "\(working) " + L("agents working", "agents bezig")
         } else {
-            view.rightDot = nil
             view.rightText = usageHeadline
         }
         view.leftText = usageSummary
+        updateWings()
         view.claudeUsage = usage.first { $0.name == "Claude" }.flatMap { $0.fiveHour ?? $0.weekly }?.used
         view.codexUsage = usage.first { $0.name == "Codex" }.flatMap { $0.fiveHour ?? $0.weekly }?.used
+    }
+
+    // MARK: Live activities
+
+    // The right wing shows the most urgent thing: an agent waiting, a timer, a download, music, an agent working, usage.
+    private func updateWings() {
+        let next: NotchView.Wing
+        if sessions.contains(where: { $0.state == .waiting }) {
+            next = .dot(.systemOrange)
+        } else if countdown.running {
+            next = .timer(NotchTimer.text(countdown.remaining), countdown.fraction)
+        } else if !downloads.isEmpty {
+            next = .download
+        } else if nowPlaying?.playing == true {
+            next = .bars
+        } else if sessions.contains(where: { $0.state == .working }) {
+            next = .dot(.systemBlue)
+        } else if let headline = usageHeadline {
+            next = .text(headline)
+        } else {
+            next = .none
+        }
+        view.music = nowPlaying
+        guard next != view.rightWing else { return }
+        let resize: Bool = {
+            switch (next, view.rightWing) {
+            case (.timer, .timer): return false
+            default: return true
+            }
+        }()
+        view.rightWing = next
+        if resize, view.mode == .compact || view.mode == .peek { view.setMode(view.mode) }
+    }
+
+    private func showNow() {
+        let page = view.content.now
+        let before = page.preferredHeight
+        page.music = nowPlaying
+        page.timer = countdown
+        page.downloads = downloads
+        page.refresh()
+        if page.preferredHeight != before { view.refit() }
+        updateWings()
+    }
+
+    private func showShelf() {
+        view.content.shelf.show(shelf.items)
+        view.refit()
+    }
+
+    private func scanDownloads() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found = DownloadWatcher.scan()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let names = Set(found.map(\.name))
+                for item in self.downloads where !names.contains(item.name) && DownloadWatcher.finished(item) {
+                    self.say(NotchAlert(symbol: "arrow.down.circle.fill", tint: .systemBlue, title: L("Downloaded", "Gedownload"),
+                                        detail: item.name), mood: .happy)
+                }
+                let changed = found.map(\.name) != self.downloads.map(\.name)
+                self.downloads = found
+                if changed || self.view.content.page == 0 { self.showNow() }
+            }
+        }
+    }
+
+    // A file drag anywhere on screen: when it comes near the notch, open a big drop zone.
+    private func watchDrag(mouse: NSPoint) {
+        let board = NSPasteboard(name: .drag)
+        let pressed = NSEvent.pressedMouseButtons & 1 != 0
+        guard pressed else {
+            dragBoardIdle = board.changeCount
+            if dropping { endDrop() }
+            return
+        }
+        guard board.changeCount != dragBoardIdle, board.types?.contains(.fileURL) == true,
+              let screen, let panel else { return }
+        let notch = notchRect(on: screen)
+        let near = abs(mouse.x - notch.midX) < 240 && mouse.y > notch.minY - 120
+        if near, !dropping {
+            startDrop()
+            panel.ignoresMouseEvents = false
+        } else if !near, dropping {
+            endDrop()
+        }
+    }
+
+    private func startDrop() {
+        guard !dropping, view.mode != .approval else { return }
+        dropping = true
+        companion.react(.surprised, for: 1.5)
+        view.setMode(.drop)
+    }
+
+    private func endDrop() {
+        guard dropping else { return }
+        dropping = false
+        if view.mode == .drop { view.setMode(hovering ? .peek : .compact) }
     }
 
     // MARK: Usage
@@ -6886,27 +7773,38 @@ final class NotchController {
         return "\(top.0) \(Int((top.1 * 100).rounded()))%"
     }
 
+    // Codex and Claude load separately: Claude may wait on a Keychain prompt, Codex never needs one.
     func refreshUsage() {
-        let demo = self.demo
+        if demo {
+            AIUsage.demo().forEach(merge)
+            return
+        }
         let claude = claudeConnected
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let found: [ProviderUsage] = demo ? AIUsage.demo() : [claude ? AIUsage.claude() : nil, AIUsage.codex()].compactMap { $0 }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let previous = self.usage
-                self.usage = found
-                self.usageUpdated = Date()
-                for provider in found {
-                    guard let now = provider.fiveHour, now.used >= 0.9,
-                          (previous.first { $0.name == provider.name }?.fiveHour?.used ?? 0) < 0.9 else { continue }
-                    self.say(NotchAlert(symbol: "gauge.with.dots.needle.100percent", tint: .systemOrange,
-                                        title: provider.name + " " + L("almost at its limit", "bijna aan de limiet"),
-                                        detail: "\(Int(now.used * 100))% " + L("of 5 hours", "van 5 uur")), mood: .worried)
-                }
-                self.showUsage()
-                self.showSessions()
-            }
+            let codex = AIUsage.codex()
+            DispatchQueue.main.async { self?.merge(codex) }
         }
+        guard claude else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let reading = AIUsage.claude()
+            DispatchQueue.main.async { self?.merge(reading) }
+        }
+    }
+
+    private func merge(_ provider: ProviderUsage) {
+        let previous = usage.first { $0.name == provider.name }
+        usage.removeAll { $0.name == provider.name }
+        usage.append(provider)
+        usage.sort { $0.name < $1.name }  // Claude, then Codex
+        usageUpdated = Date()
+        if let now = provider.fiveHour, now.used >= 0.9, (previous?.fiveHour?.used ?? 0) < 0.9 {
+            say(NotchAlert(symbol: "gauge.with.dots.needle.100percent", tint: .systemOrange,
+                           title: provider.name + " " + L("almost at its limit", "bijna aan de limiet"),
+                           detail: "\(Int(now.used * 100))% " + L("of 5 hours", "van 5 uur")), mood: .worried)
+        }
+        showUsage()
+        showSessions()
+        if view.mode == .peek { view.setMode(.peek) }  // the hover width follows the new readings
     }
 
     private func showUsage() {

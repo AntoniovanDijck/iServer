@@ -61,7 +61,7 @@ Inspired by [PureMac](https://github.com/momenbasel/PureMac). Some folders (the 
 
 ### iNotch (optional)
 
-Turn on **Notch** at the bottom of the panel and the MacBook notch becomes a small live island (a capsule on Macs without a notch). It is off by default.
+Turn on **Notch** at the bottom of the panel and the MacBook notch becomes a small live island; hover it for a quick look, click it for the Now, Agents, Limits, Shelf and Prompter tabs (a capsule on Macs without a notch). It is off by default.
 
 - 🌱 **Pip**: a little companion living beside the notch. He breathes, blinks, follows your cursor, cheers when an agent finishes, worries about a hot CPU or a low battery and dozes off when you're away. Click him in the open panel to switch between five looks
 - 🔔 **Live alerts**: a dev server started or stopped, charger plugged in, battery low or full, Awake on or off, an agent finished or waiting, a provider close to its limit
@@ -69,6 +69,9 @@ Turn on **Notch** at the bottom of the panel and the MacBook notch becomes a sma
 - ✅ **Approve from the notch**: optionally answer Claude Code's permission requests with Allow, Deny or "In terminal". This adds a `PermissionRequest` hook to `~/.claude/settings.json` (after you confirm, with a backup); if iServer isn't running, Claude Code simply asks in the terminal
 - 📊 **AI limits**: Codex's 5-hour and weekly limits are read from its local session logs. Claude's need your Claude Code sign-in from the Keychain, only after you press **Connect Claude**; the token is read, never refreshed or stored. Hover the island to see both percentages
 - 🎬 **Prompter**: type your script in the panel and it scrolls under the notch at your speed and size, hidden from screen recordings and screenshots
+- 🎵 **Music**: what's playing in Apple Music or Spotify, with artwork, progress and play/pause/skip; Pip dances along. Track info comes from the apps' own notifications; the controls and artwork ask macOS once for permission to control the app
+- 🗂️ **Shelf**: drag files onto the notch to park them, then drag them out anywhere, show them in Finder or send them with AirDrop. Files stay where they are; the shelf only remembers them
+- ⏱️ **Live activities**: a timer with a countdown in the notch, and downloads in progress in ~/Downloads with an alert when they finish
 
 Inspired by [codex-island](https://github.com/ericjypark/codex-island), [coucou](https://github.com/Louis-CFM/coucou), [DynamicNotch](https://github.com/jackson-storm/DynamicNotch) and [NotchPrompter](https://github.com/jpomykala/NotchPrompter); no code or artwork was taken from them.
 
