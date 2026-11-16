@@ -59,6 +59,19 @@ Everything is moved to the Trash after you confirm, so you can put it back. Only
 
 Inspired by [PureMac](https://github.com/momenbasel/PureMac). Some folders (the Trash, Mail, other apps' containers) need **Full Disk Access** for iServer in System Settings → Privacy & Security; without it those items are simply skipped.
 
+### iNotch (optional)
+
+Turn on **Notch** at the bottom of the panel and the MacBook notch becomes a small live island (a capsule on Macs without a notch). It is off by default.
+
+- 🌱 **Pip**: a little companion living beside the notch. He breathes, blinks, follows your cursor, cheers when an agent finishes, worries about a hot CPU or a low battery and dozes off when you're away. Click him in the open panel to switch between five looks
+- 🔔 **Live alerts**: a dev server started or stopped, charger plugged in, battery low or full, Awake on or off, an agent finished or waiting, a provider close to its limit
+- 🤖 **Agents**: what your Claude Code and Codex sessions are doing (editing, running, waiting, done), read from the logs they already write; nothing is installed for this
+- ✅ **Approve from the notch**: optionally answer Claude Code's permission requests with Allow, Deny or "In terminal". This adds a `PermissionRequest` hook to `~/.claude/settings.json` (after you confirm, with a backup); if iServer isn't running, Claude Code simply asks in the terminal
+- 📊 **AI limits**: Codex's 5-hour and weekly limits are read from its local session logs. Claude's need your Claude Code sign-in from the Keychain, only after you press **Connect Claude**; the token is read, never refreshed or stored. Hover the island to see both percentages
+- 🎬 **Prompter**: type your script in the panel and it scrolls under the notch at your speed and size, hidden from screen recordings and screenshots
+
+Inspired by [codex-island](https://github.com/ericjypark/codex-island), [coucou](https://github.com/Louis-CFM/coucou), [DynamicNotch](https://github.com/jackson-storm/DynamicNotch) and [NotchPrompter](https://github.com/jpomykala/NotchPrompter); no code or artwork was taken from them.
+
 ### Small and native
 
 - 🪶 **Tiny**: one Swift file, no dependencies, no permissions needed
@@ -101,6 +114,7 @@ Click the CPU graph in the menu bar to open the panel. The top bar shows how man
 | **Apps** | Also list regular apps that open ports (Chrome, Spotify, AirPlay…) |
 | **Login** | Start iServer automatically |
 | **Awake** | Keep the Mac and display awake until you turn it off or quit iServer |
+| **Notch** | Turn iNotch on or off |
 | <kbd>Esc</kbd> | Clear the clipboard search, or close the panel |
 
 It also works from the command line:

@@ -5,6 +5,7 @@ import Darwin
 import IOKit
 import IOKit.ps
 import IOKit.pwr_mgt
+import Network
 import ServiceManagement
 
 // MARK: - Localization (English, with Dutch when that is the preferred language)
@@ -1087,6 +1088,307 @@ enum StorageTools {
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count >= 3, (2...6).contains(parts[0].count), parts[0].allSatisfy(\.isLetter) else { return false }
         return parts.allSatisfy { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" } }
+    }
+}
+
+// MARK: - iNotch data: AI usage limits and agent sessions
+
+struct QuotaWindow {
+    var used: Double        // 0...1
+    var resetsAt: Date?
+}
+
+struct ProviderUsage {
+    let name: String
+    var plan: String?
+    var fiveHour: QuotaWindow?
+    var weekly: QuotaWindow?
+    var note: String?       // why there is no reading, or how old it is
+    var asOf: Date?
+}
+
+enum AIUsage {
+    static let home = NSHomeDirectory()
+
+    // Codex writes its current limits into every session log, so they are read locally: no network, no login.
+    static func codex() -> ProviderUsage {
+        var usage = ProviderUsage(name: "Codex")
+        let files = AgentWatcher.codexFiles(days: 8).sorted { $0.modified > $1.modified }
+        guard !files.isEmpty else {
+            usage.note = L("No Codex sessions yet", "Nog geen Codex-sessies")
+            return usage
+        }
+        for file in files.prefix(6) {
+            for line in AgentWatcher.tail(file.path, bytes: 400_000).reversed() {
+                guard line.contains("\"rate_limits\""), let entry = AgentWatcher.json(line),
+                      let payload = entry["payload"] as? [String: Any], payload["type"] as? String == "token_count",
+                      let limits = payload["rate_limits"] as? [String: Any] else { continue }
+                for key in ["primary", "secondary"] {
+                    guard let window = limits[key] as? [String: Any],
+                          let percent = (window["used_percent"] as? NSNumber)?.doubleValue else { continue }
+                    let minutes = (window["window_minutes"] as? NSNumber)?.intValue ?? (key == "primary" ? 300 : 10_080)
+                    let reset = (window["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+                    // A window that has reset since the reading was taken is empty again, with no reset time to show.
+                    let passed = reset.map { $0 < Date() } ?? false
+                    let quota = QuotaWindow(used: passed ? 0 : percent / 100, resetsAt: passed ? nil : reset)
+                    if minutes >= 1440 { usage.weekly = quota } else { usage.fiveHour = quota }
+                }
+                usage.plan = (limits["plan_type"] as? String)?.capitalized
+                usage.asOf = file.modified
+                return usage
+            }
+        }
+        usage.note = L("No limits in recent sessions", "Geen limieten in recente sessies")
+        return usage
+    }
+
+    // Claude Code keeps its sign-in in the Keychain; its usage endpoint needs that token. The token is only
+    // read, never refreshed or stored: when it has expired, running Claude Code renews it.
+    static func claude() -> ProviderUsage {
+        var usage = ProviderUsage(name: "Claude")
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String else {
+            usage.note = L("Sign in to Claude Code first", "Log eerst in bij Claude Code")
+            return usage
+        }
+        usage.plan = (oauth["subscriptionType"] as? String)?.capitalized
+        if let expires = (oauth["expiresAt"] as? NSNumber)?.doubleValue, expires / 1000 < Date().timeIntervalSince1970 {
+            usage.note = L("Sign-in expired; open Claude Code once", "Inlog verlopen; open Claude Code even")
+            return usage
+        }
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 15)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("claude-code/2.1.121", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let done = DispatchSemaphore(value: 0)
+        var body: Data?
+        var status = 0
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            body = data
+            status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 20)
+        guard status == 200, let body, let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            usage.note = status == 429 ? L("Rate limited, try later", "Te vaak gevraagd, later opnieuw")
+                : (status == 401 ? L("Sign-in expired; open Claude Code once", "Inlog verlopen; open Claude Code even")
+                   : L("Couldn't reach Claude", "Claude niet bereikbaar"))
+            return usage
+        }
+        func window(_ key: String) -> QuotaWindow? {
+            guard let entry = object[key] as? [String: Any],
+                  let percent = (entry["utilization"] as? NSNumber)?.doubleValue else { return nil }
+            var reset: Date?
+            if let text = entry["resets_at"] as? String {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                reset = formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+            }
+            return QuotaWindow(used: percent / 100, resetsAt: reset)
+        }
+        usage.fiveHour = window("five_hour")
+        usage.weekly = window("seven_day")
+        usage.asOf = Date()
+        return usage
+    }
+
+    static func demo() -> [ProviderUsage] {
+        let now = Date()
+        return [
+            ProviderUsage(name: "Claude", plan: "Max", fiveHour: QuotaWindow(used: 0.42, resetsAt: now.addingTimeInterval(7_800)),
+                          weekly: QuotaWindow(used: 0.61, resetsAt: now.addingTimeInterval(260_000)), asOf: now),
+            ProviderUsage(name: "Codex", plan: "Plus", fiveHour: QuotaWindow(used: 0.18, resetsAt: now.addingTimeInterval(12_000)),
+                          weekly: QuotaWindow(used: 0.33, resetsAt: now.addingTimeInterval(400_000)), asOf: now),
+        ]
+    }
+}
+
+enum AgentState { case working, waiting, done }
+
+struct AgentSession {
+    let id: String
+    let agent: String       // "Claude Code" or "Codex"
+    var project: String
+    var action: String
+    var state: AgentState
+    var updated: Date
+}
+
+// Follows Claude Code and Codex sessions by reading the logs they already write; nothing is installed or changed.
+enum AgentWatcher {
+    static let home = NSHomeDirectory()
+
+    struct LogFile {
+        let path: String
+        let modified: Date
+    }
+
+    static func modified(_ path: String) -> Date? {
+        (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    static func json(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    // The last lines of a file, without reading all of it.
+    static func tail(_ path: String, bytes: Int = 160_000) -> [String] {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let start = size > UInt64(bytes) ? size - UInt64(bytes) : 0
+        guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd() else { return [] }
+        var lines = String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+        if start > 0, !lines.isEmpty { lines.removeFirst() }  // likely cut in half
+        return lines
+    }
+
+    static func codexFiles(days: Int) -> [LogFile] {
+        let calendar = Calendar.current
+        var out: [LogFile] = []
+        for offset in 0..<days {
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: Date()) else { continue }
+            let parts = calendar.dateComponents([.year, .month, .day], from: day)
+            let dir = String(format: "%@/.codex/sessions/%04d/%02d/%02d", home, parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+            for path in DevClean.children(of: dir) where path.hasSuffix(".jsonl") {
+                if let date = modified(path) { out.append(LogFile(path: path, modified: date)) }
+            }
+        }
+        return out
+    }
+
+    // Sessions active in the last half hour; finished ones stay for ten minutes.
+    static func scan() -> [AgentSession] {
+        let now = Date()
+        var sessions: [AgentSession] = []
+        for dir in DevClean.children(of: home + "/.claude/projects") {
+            for path in DevClean.children(of: dir) where path.hasSuffix(".jsonl") {
+                guard let date = modified(path), now.timeIntervalSince(date) < 1800 else { continue }
+                if let session = claudeSession(path, modified: date) { sessions.append(session) }
+            }
+        }
+        for file in codexFiles(days: 1) where now.timeIntervalSince(file.modified) < 1800 {
+            if let session = codexSession(file.path, modified: file.modified) { sessions.append(session) }
+        }
+        return sessions.filter { $0.state != .done || now.timeIntervalSince($0.updated) < 600 }
+            .sorted { $0.updated > $1.updated }
+    }
+
+    static func state(finished: Bool, waitingOnTool: Bool, age: TimeInterval) -> AgentState? {
+        if finished { return .done }
+        if age < 25 { return .working }
+        if waitingOnTool { return age < 1800 ? .waiting : nil }
+        return age < 300 ? .working : nil  // quiet for long without finishing: stopped or interrupted
+    }
+
+    static func claudeSession(_ path: String, modified: Date) -> AgentSession? {
+        var cwd: String?
+        var title: String?
+        for line in tail(path).reversed() {
+            guard let entry = json(line), let type = entry["type"] as? String else { continue }
+            if type == "custom-title", title == nil { title = entry["customTitle"] as? String }
+            guard type == "assistant" || type == "user", entry["isSidechain"] as? Bool != true,
+                  let message = entry["message"] as? [String: Any] else { continue }
+            cwd = entry["cwd"] as? String
+            let content = message["content"] as? [[String: Any]] ?? []
+            var finished = false
+            var waiting = false
+            var action = L("Thinking…", "Denkt na…")
+            if type == "assistant" {
+                if let tool = content.last(where: { $0["type"] as? String == "tool_use" }) {
+                    action = describe(tool["name"] as? String ?? "", tool["input"] as? [String: Any] ?? [:])
+                    waiting = true
+                } else {
+                    finished = message["stop_reason"] as? String == "end_turn"
+                    action = L("Finished", "Klaar")
+                }
+            } else if content.contains(where: { $0["type"] as? String == "tool_result" }) {
+                action = L("Thinking…", "Denkt na…")
+            } else {
+                action = L("Got a new prompt", "Kreeg een nieuwe opdracht")
+            }
+            guard let state = state(finished: finished, waitingOnTool: waiting, age: Date().timeIntervalSince(modified)) else { return nil }
+            if state == .waiting { action = L("Waiting · may need you", "Wacht · heeft je misschien nodig") }
+            let project = cwd.map { ($0 as NSString).lastPathComponent } ?? title ?? "Claude Code"
+            return AgentSession(id: path, agent: "Claude Code", project: project, action: action, state: state, updated: modified)
+        }
+        return nil
+    }
+
+    static func codexSession(_ path: String, modified: Date) -> AgentSession? {
+        var cwd: String?
+        var state: AgentState?
+        var action: String?
+        for line in tail(path).reversed() {
+            guard let entry = json(line), let payload = entry["payload"] as? [String: Any] else { continue }
+            if cwd == nil, let dir = payload["cwd"] as? String { cwd = dir }
+            let kind = payload["type"] as? String ?? ""
+            if state == nil, action == nil {
+                switch (entry["type"] as? String ?? "", kind) {
+                case ("event_msg", "task_complete"):
+                    state = .done
+                    action = L("Finished", "Klaar")
+                case ("response_item", "function_call"), ("response_item", "custom_tool_call"):
+                    let name = payload["name"] as? String ?? ""
+                    action = name == "apply_patch" ? L("Editing files", "Bewerkt bestanden")
+                        : L("Running", "Voert uit") + " " + codexCommand(payload["arguments"] as? String ?? "")
+                case ("event_msg", "task_started"), ("response_item", "reasoning"), ("response_item", "message"):
+                    action = L("Thinking…", "Denkt na…")
+                default:
+                    break
+                }
+            }
+            if cwd != nil, action != nil { break }
+        }
+        let age = Date().timeIntervalSince(modified)
+        guard let resolved = state ?? AgentWatcher.state(finished: false, waitingOnTool: false, age: age) else { return nil }
+        let project = cwd.map { ($0 as NSString).lastPathComponent } ?? "Codex"
+        return AgentSession(id: path, agent: "Codex", project: project, action: action ?? L("Working", "Bezig"),
+                            state: resolved, updated: modified)
+    }
+
+    static func codexCommand(_ arguments: String) -> String {
+        guard let args = json(arguments) else { return "" }
+        let command = (args["command"] as? [String])?.joined(separator: " ") ?? (args["cmd"] as? String) ?? ""
+        return String(command.replacingOccurrences(of: "bash -lc ", with: "").prefix(48))
+    }
+
+    static func describe(_ tool: String, _ input: [String: Any]) -> String {
+        let file = (input["file_path"] as? String).map { ($0 as NSString).lastPathComponent } ?? ""
+        switch tool {
+        case "Edit", "MultiEdit", "Write", "NotebookEdit": return L("Editing", "Bewerkt") + " " + file
+        case "Read": return L("Reading", "Leest") + " " + file
+        case "Bash":
+            let command = (input["command"] as? String ?? "").split(separator: "\n").first.map(String.init) ?? ""
+            return L("Running", "Voert uit") + " " + String(command.prefix(48))
+        case "Grep", "Glob": return L("Searching the code", "Zoekt in de code")
+        case "WebFetch", "WebSearch": return L("Looking on the web", "Zoekt op het web")
+        case "Task", "Agent": return L("Running a helper agent", "Laat een hulpagent werken")
+        default: return L("Using", "Gebruikt") + " " + tool
+        }
+    }
+
+    static func demo() -> [AgentSession] {
+        let now = Date()
+        return [
+            AgentSession(id: "1", agent: "Claude Code", project: "acme-web", action: L("Editing", "Bewerkt") + " Checkout.tsx",
+                         state: .working, updated: now),
+            AgentSession(id: "2", agent: "Codex", project: "acme-api", action: L("Waiting · may need you", "Wacht · heeft je misschien nodig"),
+                         state: .waiting, updated: now.addingTimeInterval(-40)),
+            AgentSession(id: "3", agent: "Claude Code", project: "docs", action: L("Finished", "Klaar"),
+                         state: .done, updated: now.addingTimeInterval(-180)),
+        ]
     }
 }
 
@@ -4522,6 +4824,8 @@ final class BoardView: NSView {
     var setApps: (Bool) -> Void = { _ in }
     var setLogin: (Bool) -> Void = { _ in }
     var setAwake: (Bool) -> Void = { _ in }
+    var setNotch: (Bool) -> Void = { _ in }
+    var notchOn = false { didSet { notchToggle.checked = notchOn } }
     var quit: () -> Void = {}
     var onPage: () -> Void = {}
     var relayout: () -> Void = {}
@@ -4555,6 +4859,9 @@ final class BoardView: NSView {
                                         help: L("Also show regular apps that listen on a port", "Toon ook gewone apps die op een poort luisteren"))
     private let awakeToggle = TogglePill(L("Awake", "Wakker"), symbol: "cup.and.saucer.fill",
                                          help: L("Keep your Mac and display awake", "Houd je Mac en scherm wakker"))
+    private let notchToggle = TogglePill(L("Notch", "Notch"), symbol: "capsule.portrait.fill",
+                                         help: L("iNotch: alerts, AI limits, agents, Pip and a prompter in the notch",
+                                                 "iNotch: meldingen, AI-limieten, agents, Pip en een prompter in de notch"))
     private let loginToggle = TogglePill(L("Login", "Login"), symbol: "power",
                                          help: L("Launch iServer at login", "Open iServer bij inloggen"))
     private var quitButton: IconButton!
@@ -4571,6 +4878,7 @@ final class BoardView: NSView {
         appsToggle.onChange = { [weak self] on in self?.setApps(on) }
         loginToggle.onChange = { [weak self] on in self?.setLogin(on) }
         awakeToggle.onChange = { [weak self] on in self?.setAwake(on) }
+        notchToggle.onChange = { [weak self] on in self?.setNotch(on) }
         quitButton = IconButton(symbol: "xmark.circle", help: L("Quit iServer", "Stop iServer")) { [weak self] in self?.quit() }
 
         tabs.onSelect = { [weak self] index in
@@ -4586,6 +4894,7 @@ final class BoardView: NSView {
         footer.addSubview(appsToggle)
         footer.addSubview(loginToggle)
         footer.addSubview(awakeToggle)
+        footer.addSubview(notchToggle)
         footer.addSubview(quitButton)
 
         configure(scroll)
@@ -4879,7 +5188,1733 @@ final class BoardView: NSView {
         appsToggle.frame = NSRect(x: Metrics.inset, y: (h - pill) / 2, width: appsToggle.preferredWidth, height: pill)
         loginToggle.frame = NSRect(x: appsToggle.frame.maxX + 6, y: (h - pill) / 2, width: loginToggle.preferredWidth, height: pill)
         awakeToggle.frame = NSRect(x: loginToggle.frame.maxX + 6, y: (h - pill) / 2, width: awakeToggle.preferredWidth, height: pill)
+        notchToggle.frame = NSRect(x: awakeToggle.frame.maxX + 6, y: (h - pill) / 2, width: notchToggle.preferredWidth, height: pill)
         quitButton.frame = NSRect(x: w - Metrics.inset - 30, y: (h - pill) / 2, width: 30, height: pill)
+    }
+}
+
+// MARK: - iNotch: Pip, the companion
+
+// A damped spring for the island's size and Pip's hop.
+struct Spring {
+    var value: Double
+    var target: Double
+    var velocity = 0.0
+    var stiffness = 300.0
+    var damping = 24.0
+
+    init(_ value: Double) {
+        self.value = value
+        target = value
+    }
+
+    mutating func step(_ dt: Double = 1.0 / 60) -> Bool {
+        let force = stiffness * (target - value) - damping * velocity
+        velocity += force * dt
+        value += velocity * dt
+        if abs(target - value) < 0.25 && abs(velocity) < 0.25 {
+            value = target
+            velocity = 0
+            return false
+        }
+        return true
+    }
+}
+
+// Pip: a little peach-coloured bean with a sprout on its head. Original to iServer.
+final class Companion {
+    enum Mood { case idle, happy, worried, sleepy, surprised }
+    var mood = Mood.idle
+    private var moodUntil = Date.distantPast
+    private var nextBlink = Date().addingTimeInterval(2)
+    private var blinkUntil = Date.distantPast
+    private var hop = Spring(0)
+    private let born = Date()
+
+    static let body = NSColor(srgbRed: 1.0, green: 0.78, blue: 0.62, alpha: 1)
+    static let leaf = NSColor(srgbRed: 0.45, green: 0.85, blue: 0.48, alpha: 1)
+
+    // Pip's looks; all original to iServer.
+    enum Style: String, CaseIterable {
+        case sprout, ember, byte, puff, slime
+
+        var name: String {
+            switch self {
+            case .sprout: return L("Sprout", "Kiemplant")
+            case .ember: return L("Ember", "Vlammetje")
+            case .byte: return L("Byte", "Robotje")
+            case .puff: return L("Puff", "Wolkje")
+            case .slime: return L("Slime", "Slijmpje")
+            }
+        }
+    }
+
+    var style: Style {
+        get { Style(rawValue: UserDefaults.standard.string(forKey: "pipStyle") ?? "") ?? .sprout }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "pipStyle") }
+    }
+
+    // The face sits on the same body rectangle for every style; only the body and its extras differ.
+    private func drawBody(_ body: NSRect, size: CGFloat) {
+        let bodyW = body.width, bodyH = body.height
+        switch style {
+        case .sprout:
+            let stemBase = NSPoint(x: body.midX, y: body.maxY - size * 0.02)
+            let stemTop = NSPoint(x: body.midX + size * 0.04, y: body.maxY + size * 0.17)
+            let stem = NSBezierPath()
+            stem.move(to: stemBase)
+            stem.curve(to: stemTop, controlPoint1: NSPoint(x: stemBase.x - size * 0.05, y: stemBase.y + size * 0.08),
+                       controlPoint2: NSPoint(x: stemTop.x - size * 0.02, y: stemTop.y - size * 0.05))
+            stem.lineWidth = max(1, size * 0.045)
+            stem.lineCapStyle = .round
+            Companion.leaf.setStroke()
+            stem.stroke()
+            for side in [-1.0, 1.0] {
+                let leafPath = NSBezierPath(ovalIn: NSRect(x: -size * 0.11, y: -size * 0.045, width: size * 0.22, height: size * 0.09))
+                var transform = AffineTransform()
+                transform.translate(x: stemTop.x + CGFloat(side) * size * 0.08, y: stemTop.y + size * 0.02)
+                transform.rotate(byDegrees: CGFloat(side) * 28)
+                leafPath.transform(using: transform)
+                Companion.leaf.setFill()
+                leafPath.fill()
+            }
+            let bean = NSBezierPath(roundedRect: body, xRadius: bodyW * 0.48, yRadius: bodyH * 0.55)
+            NSGradient(starting: Companion.body.blended(withFraction: 0.25, of: .white) ?? Companion.body, ending: Companion.body)?
+                .draw(in: bean, angle: -90)
+        case .ember:
+            // A round flame: wide at the bottom, a flickering tip on top
+            let flicker = CGFloat(sin(Date().timeIntervalSinceReferenceDate * 9)) * size * 0.03
+            let flame = NSBezierPath()
+            let tip = NSPoint(x: body.midX + flicker, y: body.maxY + size * 0.26)
+            flame.move(to: tip)
+            flame.curve(to: NSPoint(x: body.maxX, y: body.minY + bodyH * 0.4),
+                        controlPoint1: NSPoint(x: body.midX + bodyW * 0.12, y: body.maxY + size * 0.05),
+                        controlPoint2: NSPoint(x: body.maxX, y: body.maxY - bodyH * 0.1))
+            flame.curve(to: NSPoint(x: body.minX, y: body.minY + bodyH * 0.4),
+                        controlPoint1: NSPoint(x: body.maxX, y: body.minY - bodyH * 0.12),
+                        controlPoint2: NSPoint(x: body.minX, y: body.minY - bodyH * 0.12))
+            flame.curve(to: tip, controlPoint1: NSPoint(x: body.minX, y: body.maxY - bodyH * 0.1),
+                        controlPoint2: NSPoint(x: body.midX - bodyW * 0.12, y: body.maxY + size * 0.05))
+            NSGradient(starting: NSColor(srgbRed: 1, green: 0.85, blue: 0.35, alpha: 1),
+                       ending: NSColor(srgbRed: 1, green: 0.45, blue: 0.2, alpha: 1))?.draw(in: flame, angle: -90)
+        case .byte:
+            // A little robot: rounded square head, antenna with a glowing tip
+            let antenna = NSBezierPath()
+            antenna.move(to: NSPoint(x: body.midX, y: body.maxY))
+            antenna.line(to: NSPoint(x: body.midX, y: body.maxY + size * 0.14))
+            antenna.lineWidth = max(1, size * 0.04)
+            NSColor(white: 0.75, alpha: 1).setStroke()
+            antenna.stroke()
+            NSColor.systemTeal.setFill()
+            NSBezierPath(ovalIn: NSRect(x: body.midX - size * 0.05, y: body.maxY + size * 0.12, width: size * 0.1, height: size * 0.1)).fill()
+            let head = NSBezierPath(roundedRect: body, xRadius: bodyW * 0.24, yRadius: bodyW * 0.24)
+            NSGradient(starting: NSColor(srgbRed: 0.86, green: 0.9, blue: 0.95, alpha: 1),
+                       ending: NSColor(srgbRed: 0.62, green: 0.68, blue: 0.78, alpha: 1))?.draw(in: head, angle: -90)
+            let screen = NSBezierPath(roundedRect: body.insetBy(dx: bodyW * 0.1, dy: bodyH * 0.14), xRadius: bodyW * 0.14, yRadius: bodyW * 0.14)
+            NSColor(srgbRed: 0.12, green: 0.16, blue: 0.22, alpha: 1).setFill()
+            screen.fill()
+        case .puff:
+            // A small cloud: a few overlapping round puffs
+            let cloud = NSBezierPath()
+            cloud.appendRoundedRect(NSRect(x: body.minX, y: body.minY, width: bodyW, height: bodyH * 0.7), xRadius: bodyH * 0.35, yRadius: bodyH * 0.35)
+            cloud.appendOval(in: NSRect(x: body.minX + bodyW * 0.1, y: body.minY + bodyH * 0.25, width: bodyW * 0.5, height: bodyH * 0.75))
+            cloud.appendOval(in: NSRect(x: body.minX + bodyW * 0.38, y: body.minY + bodyH * 0.35, width: bodyW * 0.5, height: bodyH * 0.8))
+            NSGradient(starting: .white, ending: NSColor(srgbRed: 0.85, green: 0.86, blue: 1, alpha: 1))?.draw(in: cloud, angle: -90)
+        case .slime:
+            // A wobbly blue dome with a shine
+            let wobble = CGFloat(sin(Date().timeIntervalSinceReferenceDate * 3)) * size * 0.02
+            let dome = NSBezierPath()
+            dome.move(to: NSPoint(x: body.minX - wobble, y: body.minY))
+            dome.curve(to: NSPoint(x: body.maxX + wobble, y: body.minY),
+                       controlPoint1: NSPoint(x: body.minX, y: body.maxY + bodyH * 0.35),
+                       controlPoint2: NSPoint(x: body.maxX, y: body.maxY + bodyH * 0.35))
+            dome.close()
+            NSGradient(starting: NSColor(srgbRed: 0.55, green: 0.85, blue: 1, alpha: 1),
+                       ending: NSColor(srgbRed: 0.25, green: 0.55, blue: 0.95, alpha: 1))?.draw(in: dome, angle: -90)
+            NSColor.white.withAlphaComponent(0.55).setFill()
+            NSBezierPath(ovalIn: NSRect(x: body.minX + bodyW * 0.22, y: body.maxY - bodyH * 0.3, width: bodyW * 0.15, height: bodyH * 0.11)).fill()
+        }
+    }
+
+    // A short reaction, after which Pip goes back to its resting mood.
+    func react(_ next: Mood, for seconds: TimeInterval = 2.5) {
+        mood = next
+        moodUntil = Date().addingTimeInterval(seconds)
+        if next == .happy || next == .surprised {
+            hop.velocity = next == .happy ? 90 : 60
+        }
+    }
+
+    // Called every frame; `resting` is the mood when no reaction is playing.
+    func tick(resting: Mood) {
+        let now = Date()
+        if now > moodUntil { mood = resting }
+        if now > nextBlink {
+            blinkUntil = now.addingTimeInterval(0.14)
+            nextBlink = now.addingTimeInterval(Double.random(in: 2.5...6))
+        }
+        _ = hop.step()
+        if mood == .happy, hop.value < 0.5, hop.velocity <= 0, now < moodUntil.addingTimeInterval(-0.6) {
+            hop.velocity = 70  // keep bouncing while happy
+        }
+    }
+
+    // Draws Pip in `rect` (any size). `look` is where the eyes point, in the same coordinates.
+    func draw(in rect: NSRect, look: NSPoint?) {
+        let now = Date()
+        let size = min(rect.width, rect.height)
+        let breathe = mood == .sleepy ? sin(now.timeIntervalSince(born) * 1.4) * 0.04 : sin(now.timeIntervalSince(born) * 2.2) * 0.025
+        let lift = CGFloat(max(0, hop.value)) * size / 100
+        let bodyW = size * 0.78
+        let bodyH = size * 0.62 * (1 + breathe)
+        let body = NSRect(x: rect.midX - bodyW / 2, y: rect.minY + size * 0.06 + lift, width: bodyW, height: bodyH)
+
+        drawBody(body, size: size)
+
+        // Cheeks (not on the robot's screen)
+        NSColor(srgbRed: 1, green: 0.5, blue: 0.55, alpha: style == .byte ? 0 : 0.45).setFill()
+        for side in [-1.0, 1.0] {
+            NSBezierPath(ovalIn: NSRect(x: body.midX + CGFloat(side) * bodyW * 0.3 - size * 0.06, y: body.minY + bodyH * 0.28,
+                                        width: size * 0.12, height: size * 0.07)).fill()
+        }
+
+        // Eyes look toward the cursor
+        var shift = NSPoint.zero
+        if let look {
+            let dx = look.x - body.midX, dy = look.y - body.midY
+            let length = max(1, hypot(dx, dy))
+            shift = NSPoint(x: dx / length * size * 0.035, y: dy / length * size * 0.025)
+        }
+        let eyeY = body.minY + bodyH * 0.55
+        let eyeGap = bodyW * 0.17
+        let ink = style == .byte ? NSColor.systemTeal : NSColor(srgbRed: 0.18, green: 0.12, blue: 0.1, alpha: 1)
+        let blinking = now < blinkUntil
+        for side in [-1.0, 1.0] {
+            let center = NSPoint(x: body.midX + CGFloat(side) * eyeGap + shift.x, y: eyeY + shift.y)
+            ink.setStroke()
+            ink.setFill()
+            switch mood {
+            case .happy:
+                let arc = NSBezierPath()
+                arc.appendArc(withCenter: center, radius: size * 0.05, startAngle: 20, endAngle: 160)
+                arc.lineWidth = max(1, size * 0.035)
+                arc.lineCapStyle = .round
+                arc.stroke()
+            case .sleepy:
+                let line = NSBezierPath()
+                line.move(to: NSPoint(x: center.x - size * 0.05, y: center.y))
+                line.line(to: NSPoint(x: center.x + size * 0.05, y: center.y))
+                line.lineWidth = max(1, size * 0.03)
+                line.lineCapStyle = .round
+                line.stroke()
+            default:
+                let height = blinking ? size * 0.012 : size * (mood == .surprised ? 0.12 : 0.1)
+                let width = size * (mood == .surprised ? 0.085 : 0.07)
+                NSBezierPath(ovalIn: NSRect(x: center.x - width / 2, y: center.y - height / 2, width: width, height: height)).fill()
+                if !blinking {
+                    NSColor.white.setFill()
+                    NSBezierPath(ovalIn: NSRect(x: center.x - width * 0.05, y: center.y + height * 0.1,
+                                                width: width * 0.4, height: width * 0.4)).fill()
+                }
+            }
+        }
+
+        // Mouth
+        let mouth = NSBezierPath()
+        let mouthCenter = NSPoint(x: body.midX + shift.x * 0.5, y: body.minY + bodyH * 0.3)
+        mouth.lineWidth = max(1, size * 0.03)
+        mouth.lineCapStyle = .round
+        ink.setStroke()
+        switch mood {
+        case .happy:
+            mouth.appendArc(withCenter: NSPoint(x: mouthCenter.x, y: mouthCenter.y + size * 0.03), radius: size * 0.06,
+                            startAngle: 200, endAngle: 340)
+            mouth.stroke()
+        case .surprised:
+            ink.setFill()
+            NSBezierPath(ovalIn: NSRect(x: mouthCenter.x - size * 0.03, y: mouthCenter.y - size * 0.035,
+                                        width: size * 0.06, height: size * 0.07)).fill()
+        case .worried:
+            mouth.move(to: NSPoint(x: mouthCenter.x - size * 0.05, y: mouthCenter.y))
+            mouth.curve(to: NSPoint(x: mouthCenter.x + size * 0.05, y: mouthCenter.y),
+                        controlPoint1: NSPoint(x: mouthCenter.x - size * 0.02, y: mouthCenter.y + size * 0.03),
+                        controlPoint2: NSPoint(x: mouthCenter.x + size * 0.02, y: mouthCenter.y - size * 0.03))
+            mouth.stroke()
+            // a drop of sweat
+            NSColor(srgbRed: 0.45, green: 0.75, blue: 1, alpha: 0.9).setFill()
+            let drop = NSRect(x: body.maxX - bodyW * 0.12, y: body.maxY - bodyH * 0.35, width: size * 0.07, height: size * 0.1)
+            NSBezierPath(ovalIn: drop).fill()
+        case .sleepy:
+            mouth.appendArc(withCenter: mouthCenter, radius: size * 0.025, startAngle: 0, endAngle: 360)
+            mouth.stroke()
+            if size > 30 {
+                let z = "z" as NSString
+                z.draw(at: NSPoint(x: body.maxX - size * 0.02, y: body.maxY),
+                       withAttributes: [.font: NSFont.systemFont(ofSize: size * 0.2, weight: .bold),
+                                        .foregroundColor: NSColor.white.withAlphaComponent(0.7)])
+            }
+        case .idle:
+            mouth.appendArc(withCenter: NSPoint(x: mouthCenter.x, y: mouthCenter.y + size * 0.02), radius: size * 0.035,
+                            startAngle: 210, endAngle: 330)
+            mouth.stroke()
+        }
+    }
+}
+
+// Small marks that tell Claude and Codex apart in the notch. Drawn here, not the companies' logo files.
+enum ProviderMark {
+    static let claude = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
+
+    static func draw(_ provider: String, in rect: NSRect) {
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2
+        if provider == "Claude" {
+            // A starburst of rounded rays
+            let rays = NSBezierPath()
+            for index in 0..<12 {
+                let angle = CGFloat(index) * .pi / 6 + .pi / 12
+                let outer = radius * (index % 2 == 0 ? 1 : 0.78)
+                rays.move(to: NSPoint(x: center.x + cos(angle) * radius * 0.18, y: center.y + sin(angle) * radius * 0.18))
+                rays.line(to: NSPoint(x: center.x + cos(angle) * outer, y: center.y + sin(angle) * outer))
+            }
+            rays.lineWidth = max(1.2, radius * 0.28)
+            rays.lineCapStyle = .round
+            claude.setStroke()
+            rays.stroke()
+        } else {
+            // Six loops around a centre, like a knot
+            NSColor.white.setStroke()
+            for index in 0..<6 {
+                let loop = NSBezierPath(roundedRect: NSRect(x: -radius * 0.28, y: -radius * 0.05, width: radius * 0.56, height: radius * 0.95),
+                                        xRadius: radius * 0.28, yRadius: radius * 0.28)
+                var transform = AffineTransform()
+                transform.translate(x: center.x, y: center.y)
+                transform.rotate(byDegrees: CGFloat(index) * 60)
+                loop.transform(using: transform)
+                loop.lineWidth = max(1, radius * 0.16)
+                loop.stroke()
+            }
+        }
+    }
+}
+
+// MARK: - iNotch: the island
+
+struct NotchAlert {
+    let symbol: String
+    let tint: NSColor
+    let title: String
+    let detail: String
+}
+
+// Notch-shaped surface: compact around the hardware notch, wider on hover, a panel when clicked, wide for alerts.
+final class NotchView: NSView {
+    enum Mode { case hidden, compact, peek, expanded, alert, approval }
+    var mode = Mode.compact
+    var notch = NSSize(width: 200, height: 32)  // the hardware cut-out (or a capsule on Macs without one)
+    var hasNotch = true
+    var companion: Companion?
+    var leftText: String?        // shown beside Pip when peeking (no usage readings)
+    var rightText: String?
+    var claudeUsage: Double?     // 5-hour usage 0...1, shown with its mark when peeking
+    var codexUsage: Double?
+    var rightDot: NSColor?       // status dot in the right wing
+    var alert: NotchAlert?
+    let content = NotchContent()
+    let card = ApprovalCard()
+    // Underdamped springs overshoot a little, which gives the island its jelly feel.
+    private var width = NotchView.jelly(200)
+    private var height = NotchView.jelly(32)
+    private var radius = Spring(10)
+
+    private static func jelly(_ value: Double) -> Spring {
+        var spring = Spring(value)
+        spring.stiffness = 260
+        spring.damping = 29  // just under critical damping: a hint of give, no wobble
+        return spring
+    }
+    var onClick: () -> Void = {}
+    var onPip: () -> Void = {}
+
+    // Where Pip sits in the open panel.
+    private var pipRect: NSRect {
+        let rect = shapeRect
+        return NSRect(x: rect.minX + 16, y: rect.maxY - notch.height + 2, width: notch.height - 4, height: notch.height - 4)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addSubview(content)
+        addSubview(card)
+        content.alphaValue = 0
+        content.isHidden = true
+        card.alphaValue = 0
+        card.isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var wing: CGFloat { 38 }
+    private var hasLeft: Bool { companion != nil }
+    private var hasRight: Bool { rightDot != nil || rightText != nil }
+
+    // Size of the black shape for each mode.
+    private func target(_ mode: Mode) -> (CGFloat, CGFloat, CGFloat) {
+        let base = notch.width
+        let corner: CGFloat = hasNotch ? 10 : notch.height / 2
+        switch mode {
+        case .hidden: return (base, notch.height, corner)
+        case .compact:
+            let extra = (hasLeft || hasRight) ? wing * 2 : 0
+            return (base + extra, notch.height, corner)
+        case .peek: return (base + 260, notch.height + 4, hasNotch ? 14 : (notch.height + 4) / 2)
+        case .alert: return (base + 330, notch.height + 6, hasNotch ? 16 : (notch.height + 6) / 2)
+        case .expanded: return (max(520, base + 300), notch.height + 18 + content.preferredHeight, 26)
+        case .approval: return (max(520, base + 300), notch.height + 112, 26)
+        }
+    }
+
+    // Re-target the open panel's height, e.g. after switching pages.
+    func refit() {
+        guard mode == .expanded else { return }
+        setMode(.expanded)
+    }
+
+    func setMode(_ next: Mode) {
+        mode = next
+        let (w, h, r) = target(next)
+        width.target = Double(w)
+        height.target = Double(h)
+        radius.target = Double(r)
+        content.isHidden = false
+        card.isHidden = false
+        Animator.shared.run(self) { [weak self] in
+            guard let self else { return false }
+            let moving = [self.width.step(), self.height.step(), self.radius.step()].contains(true)
+            self.needsLayout = true
+            self.needsDisplay = true
+            if !moving, self.mode != .expanded { self.content.isHidden = true }
+            if !moving, self.mode != .approval { self.card.isHidden = true }
+            return moving
+        }
+    }
+
+    // Snap to the current mode without animating (first show, screen change).
+    func settle() {
+        let (w, h, r) = target(mode)
+        width = NotchView.jelly(Double(w))
+        height = NotchView.jelly(Double(h))
+        radius = Spring(Double(r))
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    // Squash and stretch: while the island grows taller it gets a bit narrower, and the other way round,
+    // as if it keeps its volume.
+    var shapeRect: NSRect {
+        let tall = CGFloat(max(-0.03, min(0.03, height.velocity / 5000)))
+        let wide = CGFloat(max(-0.02, min(0.02, width.velocity / 8000)))
+        let w = CGFloat(width.value) * (1 - tall * 0.6 + wide * 0.2)
+        let h = max(notch.height, CGFloat(height.value) * (1 - wide * 0.5 + tall * 0.2))
+        return NSRect(x: bounds.midX - w / 2, y: bounds.maxY - h, width: w, height: h)
+    }
+
+    // Square top flush with the screen edge, small flared "ears", rounded bottom.
+    var shapePath: NSBezierPath {
+        let rect = shapeRect
+        let r = min(CGFloat(radius.value), rect.height / 2, rect.width / 2)
+        let path = NSBezierPath()
+        if hasNotch {
+            let ear: CGFloat = 6
+            path.move(to: NSPoint(x: rect.minX - ear, y: rect.maxY))
+            path.line(to: NSPoint(x: rect.maxX + ear, y: rect.maxY))
+            path.curve(to: NSPoint(x: rect.maxX, y: rect.maxY - ear), controlPoint1: NSPoint(x: rect.maxX, y: rect.maxY),
+                       controlPoint2: NSPoint(x: rect.maxX, y: rect.maxY))
+            path.line(to: NSPoint(x: rect.maxX, y: rect.minY + r))
+            path.appendArc(withCenter: NSPoint(x: rect.maxX - r, y: rect.minY + r), radius: r, startAngle: 0, endAngle: -90, clockwise: true)
+            path.line(to: NSPoint(x: rect.minX + r, y: rect.minY))
+            path.appendArc(withCenter: NSPoint(x: rect.minX + r, y: rect.minY + r), radius: r, startAngle: 270, endAngle: 180, clockwise: true)
+            path.line(to: NSPoint(x: rect.minX, y: rect.maxY - ear))
+            path.curve(to: NSPoint(x: rect.minX - ear, y: rect.maxY), controlPoint1: NSPoint(x: rect.minX, y: rect.maxY),
+                       controlPoint2: NSPoint(x: rect.minX, y: rect.maxY))
+            path.close()
+        } else {
+            path.appendRoundedRect(rect, xRadius: r, yRadius: r)
+        }
+        return path
+    }
+
+    // How open the panel is, 0...1, for fading its content.
+    private var openness: CGFloat {
+        let closed = notch.height, open = target(mode == .approval ? .approval : .expanded).1
+        return min(1, max(0, (CGFloat(height.value) - closed - 40) / max(1, open - closed - 40)))
+    }
+
+    override func layout() {
+        super.layout()
+        let rect = shapeRect
+        content.frame = NSRect(x: rect.minX + 18, y: rect.minY + 12, width: max(0, rect.width - 36),
+                               height: max(0, rect.height - notch.height - 18))
+        content.alphaValue = mode == .expanded ? openness * openness : 0
+        card.frame = content.frame
+        card.alphaValue = mode == .approval ? openness * openness : 0
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard shapePath.contains(local) else { return nil }
+        if mode == .expanded, let hit = content.hitTest(local) { return hit }
+        if mode == .approval, let hit = card.hitTest(local) { return hit }
+        return self
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard shapePath.contains(point) else { return }
+        if mode == .expanded, pipRect.insetBy(dx: -6, dy: -4).contains(point) { onPip() } else { onClick() }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard mode != .hidden || width.value > Double(notch.width) + 1 else { return }
+        NSColor.black.setFill()
+        shapePath.fill()
+        let rect = shapeRect
+        let band = NSRect(x: rect.minX, y: rect.maxY - notch.height, width: rect.width, height: notch.height)
+        let look = window.map { convert($0.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil) }
+
+        switch mode {
+        case .alert:
+            guard let alert else { break }
+            let iconRect = NSRect(x: band.minX + 14, y: band.midY - 11, width: 22, height: 22)
+            drawSymbol(alert.symbol, in: iconRect, pointSize: 15, weight: .semibold, color: alert.tint)
+            if let companion, band.width > notch.width + 200 {
+                companion.draw(in: NSRect(x: band.minX + 42, y: band.minY + 3, width: band.height - 4, height: band.height - 4), look: look)
+            }
+            let textX = band.midX + notch.width / 2 + 12
+            let maxWidth = band.maxX - 14 - textX
+            if maxWidth > 40 {
+                drawLine(alert.title, at: NSPoint(x: textX, y: band.midY + 1), width: maxWidth, font: termFont(12, .semibold), color: .white)
+                drawLine(alert.detail, at: NSPoint(x: textX, y: band.midY - 13), width: maxWidth, font: termFont(10.5, .medium),
+                         color: NSColor.white.withAlphaComponent(0.6))
+            }
+        case .compact, .peek, .hidden:
+            let wingWidth = (band.width - notch.width) / 2
+            guard wingWidth > 12 else { break }
+            if let companion {
+                let side = min(band.height - 4, 30)
+                companion.draw(in: NSRect(x: band.minX + max(4, (min(wingWidth, wing) - side) / 2), y: band.minY + 2,
+                                          width: side, height: side), look: look)
+            }
+            if mode == .peek, claudeUsage != nil || codexUsage != nil, wingWidth > 90 {
+                // Like codex-island: each provider's mark and its 5-hour percentage, one on each side.
+                let font = roundedFont(13, .bold)
+                if let claudeUsage {
+                    let mark = NSRect(x: band.minX + 42, y: band.midY - 8, width: 16, height: 16)
+                    ProviderMark.draw("Claude", in: mark)
+                    Draw.text("\(Int((claudeUsage * 100).rounded()))%", font: font, color: Draw.level(claudeUsage, .white),
+                              at: NSPoint(x: mark.maxX + 6, y: band.midY - 8))
+                }
+                if let codexUsage {
+                    let mark = NSRect(x: band.midX + notch.width / 2 + 12, y: band.midY - 8, width: 16, height: 16)
+                    ProviderMark.draw("Codex", in: mark)
+                    Draw.text("\(Int((codexUsage * 100).rounded()))%", font: font, color: Draw.level(codexUsage, .white),
+                              at: NSPoint(x: mark.maxX + 6, y: band.midY - 8))
+                }
+            } else if mode == .peek {
+                if let leftText, wingWidth > 90 {
+                    drawLine(leftText, at: NSPoint(x: band.minX + 42, y: band.midY - 7), width: wingWidth - 50,
+                             font: termFont(11.5, .semibold), color: .white)
+                }
+                if let rightText, wingWidth > 90 {
+                    drawLine(rightText, at: NSPoint(x: band.midX + notch.width / 2 + 10, y: band.midY - 7), width: wingWidth - 34,
+                             font: termFont(11.5, .semibold), color: NSColor.white.withAlphaComponent(0.85))
+                }
+            }
+            if let rightDot {
+                let dot = NSRect(x: band.maxX - min(wingWidth, wing) / 2 - 4, y: band.midY - 4, width: 8, height: 8)
+                rightDot.setFill()
+                NSBezierPath(ovalIn: dot).fill()
+            } else if let rightText, mode == .compact {
+                let font = roundedFont(11, .bold)
+                let w = Draw.width(rightText, font: font)
+                Draw.text(rightText, font: font, color: .white, at: NSPoint(x: band.maxX - min(wingWidth, wing) / 2 - w / 2, y: band.midY - 7))
+            }
+        case .expanded, .approval:
+            if let companion {
+                companion.draw(in: NSRect(x: band.minX + 16, y: band.minY + 2, width: band.height - 4, height: band.height - 4), look: look)
+            }
+            if mode == .approval {
+                let dot = NSRect(x: band.maxX - 26, y: band.midY - 5, width: 10, height: 10)
+                NSColor.systemOrange.setFill()
+                NSBezierPath(ovalIn: dot).fill()
+            }
+        }
+    }
+
+    private func drawLine(_ text: String, at point: NSPoint, width: CGFloat, font: NSFont, color: NSColor) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        (text as NSString).draw(with: NSRect(x: point.x, y: point.y, width: width, height: font.pointSize + 4),
+                                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
+    }
+}
+
+// The open panel: Agents, Limits and Prompter pages.
+final class NotchContent: NSView {
+    override var isFlipped: Bool { true }
+    let tabs = ModeBar(titles: [L("Agents", "Agents"), L("Limits", "Limieten"), L("Prompter", "Prompter")])
+    let agents = AgentsPage()
+    let usage = UsagePage()
+    let prompter = PrompterPage()
+    private(set) var page = 0
+    var onPage: () -> Void = {}
+
+    // Height of the open panel's content for the current page.
+    var preferredHeight: CGFloat {
+        switch page {
+        case 0: return 44 + max(100, CGFloat(agents.count) * 46 + 4) + 36
+        case 1: return 44 + 256
+        default: return 44 + 162
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        tabs.onSelect = { [weak self] in self?.show($0) }
+        for view in [tabs, agents, usage, prompter] as [NSView] { addSubview(view) }
+        show(0)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Clicks on empty parts of the open panel stay here instead of closing it.
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+
+    func show(_ index: Int) {
+        page = index
+        agents.isHidden = index != 0
+        usage.isHidden = index != 1
+        prompter.isHidden = index != 2
+        onPage()
+    }
+
+    override func layout() {
+        super.layout()
+        tabs.frame = NSRect(x: -Metrics.inset + 2, y: 0, width: bounds.width + Metrics.inset * 2 - 4, height: 36)
+        let page = NSRect(x: 0, y: 44, width: bounds.width, height: max(0, bounds.height - 44))
+        for view in [agents, usage, prompter] as [NSView] { view.frame = page }
+    }
+}
+
+final class AgentsPage: NSView {
+    override var isFlipped: Bool { true }
+    var onHook: () -> Void = {}
+    private lazy var hookButton = QuietButton("") { [weak self] in self?.onHook() }
+    private let hookLabel = makeLabel("", size: 10.5, weight: .regular, color: NSColor.white.withAlphaComponent(0.5))
+    private var sessions: [AgentSession] = []
+    var count: Int { sessions.count }
+    private let empty = makeLabel("", size: 12, weight: .medium, color: NSColor.white.withAlphaComponent(0.55))
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        empty.alignment = .center
+        empty.stringValue = L("No Claude Code or Codex sessions in the last 30 minutes",
+                              "Geen Claude Code- of Codex-sessies in het afgelopen halfuur")
+        addSubview(empty)
+        addSubview(hookButton)
+        addSubview(hookLabel)
+    }
+
+    func showHook(installed: Bool) {
+        hookButton.title.stringValue = installed ? L("Turn off", "Uitzetten") : L("Approve from the notch", "Goedkeuren vanuit de notch")
+        hookLabel.stringValue = installed
+            ? L("Claude Code asks for permission here", "Claude Code vraagt hier om toestemming")
+            : L("Allow or deny Claude Code requests here", "Sta Claude Code-verzoeken hier toe of weiger ze")
+        needsLayout = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ sessions: [AgentSession]) {
+        self.sessions = Array(sessions.prefix(5))
+        empty.isHidden = !sessions.isEmpty
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        empty.frame = NSRect(x: 0, y: 36, width: bounds.width, height: 18)
+        let width = hookButton.title.intrinsicContentSize.width + 28
+        hookButton.frame = NSRect(x: 0, y: bounds.height - 28, width: width, height: 26)
+        hookLabel.frame = NSRect(x: width + 10, y: bounds.height - 21, width: max(0, bounds.width - width - 12), height: 14)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        var y: CGFloat = 0
+        for session in sessions {
+            let row = NSRect(x: 0, y: y, width: bounds.width, height: 44)
+            let card = NSBezierPath(roundedRect: row.insetBy(dx: 0, dy: 2), xRadius: 12, yRadius: 12)
+            NSColor.white.withAlphaComponent(0.07).setFill()
+            card.fill()
+            let codex = session.agent == "Codex"
+            let tile = NSRect(x: row.minX + 10, y: row.midY - 13, width: 26, height: 26)
+            let tint: NSColor = codex ? NSColor(white: 0.85, alpha: 1) : NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
+            tint.withAlphaComponent(0.2).setFill()
+            NSBezierPath(roundedRect: tile, xRadius: 7, yRadius: 7).fill()
+            drawSymbol(codex ? "chevron.left.forwardslash.chevron.right" : "sparkle", in: tile, pointSize: 12, weight: .bold, color: tint)
+
+            let (label, color): (String, NSColor) = {
+                switch session.state {
+                case .working: return (L("Working", "Bezig"), .systemBlue)
+                case .waiting: return (L("Waiting", "Wacht"), .systemOrange)
+                case .done: return (L("Done", "Klaar"), .systemGreen)
+                }
+            }()
+            let pillFont = termFont(10.5, .semibold)
+            let pillWidth = Draw.width(label, font: pillFont) + 22
+            let pill = NSRect(x: row.maxX - 10 - pillWidth, y: row.midY - 10, width: pillWidth, height: 20)
+            color.withAlphaComponent(0.22).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: 10, yRadius: 10).fill()
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: pill.minX + 8, y: pill.midY - 3, width: 6, height: 6)).fill()
+            Draw.text(label, font: pillFont, color: color, at: NSPoint(x: pill.minX + 17, y: pill.midY - 7))
+
+            let textX = tile.maxX + 10
+            let textWidth = pill.minX - 8 - textX
+            let title = session.project + "  ·  " + session.agent
+            let titleAttrs: [NSAttributedString.Key: Any] = [.font: termFont(12, .semibold), .foregroundColor: NSColor.white]
+            (title as NSString).draw(with: NSRect(x: textX, y: row.minY + 7, width: textWidth, height: 16),
+                                     options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: titleAttrs)
+            let detailAttrs: [NSAttributedString.Key: Any] = [.font: termFont(10.5, .regular),
+                                                              .foregroundColor: NSColor.white.withAlphaComponent(0.6)]
+            (session.action as NSString).draw(with: NSRect(x: textX, y: row.minY + 23, width: textWidth, height: 14),
+                                              options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: detailAttrs)
+            y += 46
+        }
+    }
+}
+
+final class UsagePage: NSView {
+    override var isFlipped: Bool { true }
+    var onConnectClaude: () -> Void = {}
+    var onRefresh: () -> Void = {}
+    private var providers: [ProviderUsage] = []
+    private var claudeConnected = false
+    private lazy var connect = AccentButton { [weak self] in self?.onConnectClaude() }
+    private lazy var refresh = IconButton(symbol: "arrow.clockwise", help: L("Refresh", "Vernieuwen")) { [weak self] in self?.onRefresh() }
+    private let footer = makeLabel("", size: 10.5, weight: .regular, color: NSColor.white.withAlphaComponent(0.5))
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        connect.title = L("Connect Claude", "Claude koppelen")
+        for view in [connect, refresh, footer] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ providers: [ProviderUsage], claudeConnected: Bool, updated: Date?) {
+        self.providers = providers
+        self.claudeConnected = claudeConnected
+        connect.isHidden = claudeConnected
+        footer.stringValue = claudeConnected
+            ? updated.map { L("Updated", "Bijgewerkt") + " " + NotchFormat.ago($0) } ?? L("Not loaded yet", "Nog niet geladen")
+            : L("Claude limits need your Claude Code sign-in from the Keychain", "Claude-limieten gebruiken je Claude Code-inlog uit de sleutelhanger")
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        let width = connect.preferredWidth
+        connect.frame = NSRect(x: bounds.width / 4 - width / 2, y: 70, width: width, height: 28)
+        refresh.frame = NSRect(x: bounds.width - 26, y: bounds.height - 26, width: 26, height: 24)
+        footer.frame = NSRect(x: 2, y: bounds.height - 22, width: bounds.width - 34, height: 14)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let column = (bounds.width - 12) / 2
+        for (index, name) in ["Claude", "Codex"].enumerated() {
+            let x = CGFloat(index) * (column + 12)
+            let box = NSRect(x: x, y: 0, width: column, height: bounds.height - 34)
+            NSColor.white.withAlphaComponent(0.07).setFill()
+            NSBezierPath(roundedRect: box, xRadius: 14, yRadius: 14).fill()
+            let provider = providers.first { $0.name == name }
+            Draw.text(name, font: termFont(13, .semibold), color: .white, at: NSPoint(x: box.minX + 14, y: box.minY + 12))
+            if let plan = provider?.plan {
+                let font = termFont(10.5, .semibold)
+                let w = Draw.width(plan, font: font) + 14
+                let pill = NSRect(x: box.maxX - 14 - w, y: box.minY + 12, width: w, height: 18)
+                NSColor.white.withAlphaComponent(0.12).setFill()
+                NSBezierPath(roundedRect: pill, xRadius: 9, yRadius: 9).fill()
+                Draw.text(plan, font: font, color: NSColor.white.withAlphaComponent(0.8), at: NSPoint(x: pill.minX + 7, y: pill.minY + 2))
+            }
+            if name == "Claude" && !claudeConnected { continue }
+            var y = box.minY + 44
+            let windows: [(String, QuotaWindow?)] = [(L("5 hours", "5 uur"), provider?.fiveHour), (L("Week", "Week"), provider?.weekly)]
+            if windows.allSatisfy({ $0.1 == nil }) {
+                let note = provider?.note ?? L("Loading…", "Laden…")
+                let attrs: [NSAttributedString.Key: Any] = [.font: termFont(11, .medium), .foregroundColor: NSColor.white.withAlphaComponent(0.6)]
+                (note as NSString).draw(with: NSRect(x: box.minX + 14, y: y, width: box.width - 28, height: 60),
+                                        options: [.usesLineFragmentOrigin], attributes: attrs)
+                continue
+            }
+            for (label, window) in windows {
+                guard let window else { continue }
+                Draw.text(label, font: termFont(11, .medium), color: NSColor.white.withAlphaComponent(0.6), at: NSPoint(x: box.minX + 14, y: y))
+                let percent = "\(Int((window.used * 100).rounded()))%"
+                let font = roundedFont(13, .bold)
+                Draw.text(percent, font: font, color: .white, at: NSPoint(x: box.maxX - 14 - Draw.width(percent, font: font), y: y - 1))
+                let bar = NSRect(x: box.minX + 14, y: y + 20, width: box.width - 28, height: 6)
+                NSColor.white.withAlphaComponent(0.12).setFill()
+                NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
+                var filled = bar
+                filled.size.width = max(bar.height, bar.width * CGFloat(min(1, window.used)))
+                Draw.level(window.used, name == "Claude" ? NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1) : .systemTeal).setFill()
+                NSBezierPath(roundedRect: filled, xRadius: 3, yRadius: 3).fill()
+                if let reset = window.resetsAt {
+                    Draw.text(L("resets", "reset") + " " + NotchFormat.until(reset), font: termFont(10, .regular),
+                              color: NSColor.white.withAlphaComponent(0.5), at: NSPoint(x: box.minX + 14, y: y + 30))
+                }
+                y += 56
+            }
+            if let asOf = provider?.asOf, name == "Codex" {
+                Draw.text(L("as of", "stand van") + " " + NotchFormat.ago(asOf), font: termFont(10, .regular),
+                          color: NSColor.white.withAlphaComponent(0.4), at: NSPoint(x: box.minX + 14, y: box.maxY - 20))
+            }
+        }
+    }
+}
+
+// Type or paste the script right here; it is saved as you type.
+final class PrompterPage: NSView, NSTextViewDelegate {
+    override var isFlipped: Bool { true }
+    var onText: (String) -> Void = { _ in }
+    var onPlay: () -> Void = {}
+    var onReset: () -> Void = {}
+    var onSpeed: (Int) -> Void = { _ in }
+    var onSize: (Int) -> Void = { _ in }
+    private let scroll = NSScrollView()
+    private let editor = NSTextView()
+    private let placeholder = makeLabel(L("Type or paste your script here…", "Typ of plak hier je tekst…"), size: 13,
+                                        weight: .regular, color: NSColor.white.withAlphaComponent(0.35))
+    private let info = makeLabel("", size: 11, weight: .medium, color: NSColor.white.withAlphaComponent(0.55))
+    private lazy var play = AccentButton { [weak self] in self?.onPlay() }
+    private lazy var reset = IconButton(symbol: "backward.end.fill", help: L("Back to the start", "Terug naar begin")) { [weak self] in self?.onReset() }
+    private lazy var slower = IconButton(symbol: "tortoise.fill", help: L("Slower", "Langzamer")) { [weak self] in self?.onSpeed(-1) }
+    private lazy var faster = IconButton(symbol: "hare.fill", help: L("Faster", "Sneller")) { [weak self] in self?.onSpeed(1) }
+    private lazy var smaller = IconButton(symbol: "textformat.size.smaller", help: L("Smaller text", "Kleinere tekst")) { [weak self] in self?.onSize(-1) }
+    private lazy var bigger = IconButton(symbol: "textformat.size.larger", help: L("Bigger text", "Grotere tekst")) { [weak self] in self?.onSize(1) }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        editor.isRichText = false
+        editor.allowsUndo = true
+        editor.font = NSFont.systemFont(ofSize: 13)
+        editor.textColor = .white
+        editor.insertionPointColor = .white
+        editor.drawsBackground = false
+        editor.textContainerInset = NSSize(width: 8, height: 8)
+        editor.isAutomaticQuoteSubstitutionEnabled = false
+        editor.delegate = self
+        editor.autoresizingMask = [.width]
+        scroll.documentView = editor
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.borderType = .noBorder
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 12
+        scroll.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.07).cgColor
+        for view in [scroll, placeholder, info, play, reset, slower, faster, smaller, bigger] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func textDidChange(_ notification: Notification) {
+        placeholder.isHidden = !editor.string.isEmpty
+        onText(editor.string)
+    }
+
+    func show(text: String, running: Bool, speed: Int, size: Int) {
+        if editor.string != text, window?.firstResponder !== editor { editor.string = text }
+        placeholder.isHidden = !text.isEmpty
+        info.stringValue = L("Speed", "Snelheid") + " \(speed)  ·  " + L("Size", "Grootte") + " \(size)  ·  "
+            + L("hidden from screen recordings", "onzichtbaar in schermopnames")
+        play.title = running ? L("Stop", "Stop") : L("Start", "Start")
+        play.enabled = running || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        scroll.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 96)
+        editor.frame.size.width = scroll.contentSize.width
+        placeholder.frame = NSRect(x: 13, y: 9, width: bounds.width - 26, height: 18)
+        info.frame = NSRect(x: 2, y: 104, width: bounds.width - 4, height: 14)
+        let y: CGFloat = 126
+        let playWidth = max(84, play.preferredWidth)
+        play.frame = NSRect(x: 0, y: y, width: playWidth, height: 30)
+        var x = bounds.width - 30
+        for button in [bigger, smaller, faster, slower, reset] {
+            button.frame = NSRect(x: x, y: y + 3, width: 28, height: 24)
+            x -= 32
+        }
+    }
+}
+
+enum NotchFormat {
+    static func ago(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 { return L("just now", "zojuist") }
+        if seconds < 3600 { return "\(seconds / 60)m " + L("ago", "geleden") }
+        if seconds < 86_400 { return "\(seconds / 3600)\(L("h", "u")) " + L("ago", "geleden") }
+        return "\(seconds / 86_400)d " + L("ago", "geleden")
+    }
+
+    static func until(_ date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSinceNow))
+        if seconds < 3600 { return L("in", "over") + " \(seconds / 60)m" }
+        if seconds < 86_400 { return L("in", "over") + " \(seconds / 3600)\(L("h", "u")) \((seconds % 3600) / 60)m" }
+        return L("in", "over") + " \(seconds / 86_400)d \((seconds % 86_400) / 3600)\(L("h", "u"))"
+    }
+}
+
+// MARK: - iNotch: teleprompter
+
+final class PrompterView: NSView {
+    var text = ""
+    var fontSize: CGFloat = 24
+    var offset: CGFloat = 0
+    var onClick: () -> Void = {}
+
+    override var isFlipped: Bool { true }
+
+    var textHeight: CGFloat {
+        attributed.boundingRect(with: NSSize(width: bounds.width - 48, height: .greatestFiniteMagnitude),
+                                options: [.usesLineFragmentOrigin]).height
+    }
+
+    private var attributed: NSAttributedString {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.lineSpacing = fontSize * 0.25
+        return NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold), .foregroundColor: NSColor.white, .paragraphStyle: style,
+        ])
+    }
+
+    override func mouseUp(with event: NSEvent) { onClick() }
+
+    override func scrollWheel(with event: NSEvent) {
+        offset = max(-bounds.height / 2, offset - event.scrollingDeltaY)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds, xRadius: 22, yRadius: 22)
+        NSColor.black.setFill()
+        shape.fill()
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        attributed.draw(with: NSRect(x: 24, y: 24 - offset, width: bounds.width - 48, height: textHeight + 20),
+                        options: [.usesLineFragmentOrigin])
+        // Fade the top and bottom edges
+        NSGradient(starting: .black, ending: NSColor.black.withAlphaComponent(0))?.draw(in: NSRect(x: 0, y: 0, width: bounds.width, height: 26), angle: 90)
+        NSGradient(starting: NSColor.black.withAlphaComponent(0), ending: .black)?
+            .draw(in: NSRect(x: 0, y: bounds.height - 30, width: bounds.width, height: 30), angle: 90)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+// Scrolls text under the notch, like a teleprompter. Hidden from screen recordings and screenshots.
+final class Prompter {
+    private let defaults = UserDefaults.standard
+    private var panel: NSPanel?
+    private let view = PrompterView()
+    private var timer: Timer?
+    private(set) var running = false
+    var onChange: () -> Void = {}
+
+    var text: String {
+        get { defaults.string(forKey: "prompterText") ?? "" }
+        set { defaults.set(newValue, forKey: "prompterText") }
+    }
+    var speed: Int {
+        get { max(1, defaults.integer(forKey: "prompterSpeed") == 0 ? 4 : defaults.integer(forKey: "prompterSpeed")) }
+        set { defaults.set(min(10, max(1, newValue)), forKey: "prompterSpeed") }
+    }
+    var size: Int {
+        get { defaults.integer(forKey: "prompterSize") == 0 ? 3 : defaults.integer(forKey: "prompterSize") }
+        set { defaults.set(min(6, max(1, newValue)), forKey: "prompterSize") }
+    }
+
+    func toggle(below notch: NSRect, on screen: NSScreen) {
+        running ? stop() : start(below: notch, on: screen)
+    }
+
+    func start(below notch: NSRect, on screen: NSScreen) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let width: CGFloat = 560, height: CGFloat = 170
+        let frame = NSRect(x: notch.midX - width / 2, y: notch.minY - height - 8, width: width, height: height)
+        let panel = self.panel ?? {
+            let panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = false
+            panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+            panel.sharingType = .none  // not captured by screen recordings or screenshots
+            panel.contentView = view
+            return panel
+        }()
+        self.panel = panel
+        panel.setFrame(frame, display: true)
+        view.text = text
+        view.fontSize = CGFloat(14 + size * 4)
+        view.offset = -20
+        view.onClick = { [weak self] in self?.stop() }
+        panel.orderFrontRegardless()
+        running = true
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.advance() }
+        RunLoop.main.add(timer!, forMode: .common)
+        onChange()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        panel?.orderOut(nil)
+        running = false
+        onChange()
+    }
+
+    func restart() {
+        view.offset = -20
+        view.needsDisplay = true
+    }
+
+    private func advance() {
+        view.offset += CGFloat(speed) * 0.1  // 6 points a second per speed step
+        if view.offset > view.textHeight + 40 { view.offset = -view.bounds.height + 40 }
+        view.needsDisplay = true
+    }
+
+    func adjust(speed delta: Int) {
+        speed += delta
+        onChange()
+    }
+
+    func adjust(size delta: Int) {
+        size += delta
+        view.fontSize = CGFloat(14 + size * 4)
+        view.needsDisplay = true
+        onChange()
+    }
+}
+
+// MARK: - iNotch: approving Claude Code requests from the notch
+
+struct ApprovalRequest {
+    let id = UUID()
+    let tool: String
+    let summary: String
+    let project: String
+    let received = Date()
+}
+
+enum ApprovalAnswer { case allow, deny, terminal }
+
+// Claude Code's PermissionRequest hook posts each request to this local server and waits for the answer.
+// Only 127.0.0.1 is listened on. If iServer isn't running the hook gets no answer and Claude Code asks in
+// the terminal as usual.
+final class ApprovalServer {
+    static let port: UInt16 = 47_823
+    static let path = "/iserver/claude/permission"
+    var onRequest: (ApprovalRequest) -> Void = { _ in }
+    var onExpire: (UUID) -> Void = { _ in }
+    private var listener: NWListener?
+    private var waiting: [UUID: NWConnection] = [:]
+    private let queue = DispatchQueue(label: "iserver.approvals")
+
+    func start() {
+        guard listener == nil else { return }
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: ApprovalServer.port)!)
+        parameters.allowLocalEndpointReuse = true
+        guard let listener = try? NWListener(using: parameters) else { return }
+        listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+        listener.start(queue: queue)
+        self.listener = listener
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        queue.async {
+            for connection in self.waiting.values { self.reply(connection, body: "") }
+            self.waiting.removeAll()
+        }
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        read(connection, buffer: Data())
+    }
+
+    // Reads one HTTP request (headers plus a Content-Length body).
+    private func read(_ connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
+            guard let self else { return }
+            var buffer = buffer
+            if let data { buffer.append(data) }
+            guard buffer.count < 2_000_000, error == nil else { return connection.cancel() }
+            if let split = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                let head = String(decoding: buffer[..<split.lowerBound], as: UTF8.self)
+                let length = head.split(separator: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
+                    .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
+                let body = buffer[split.upperBound...]
+                if body.count >= length {
+                    let firstLine = head.split(separator: "\r\n").first.map(String.init) ?? ""
+                    self.handle(connection, line: firstLine, body: Data(body.prefix(length)))
+                    return
+                }
+            }
+            if complete { connection.cancel() } else { self.read(connection, buffer: buffer) }
+        }
+    }
+
+    private func handle(_ connection: NWConnection, line: String, body: Data) {
+        guard line.hasPrefix("POST \(ApprovalServer.path)"),
+              let payload = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            return reply(connection, body: "", status: "404 Not Found")
+        }
+        let tool = payload["tool_name"] as? String ?? "Tool"
+        let input = payload["tool_input"] as? [String: Any] ?? [:]
+        let project = (payload["cwd"] as? String).map { ($0 as NSString).lastPathComponent } ?? "Claude Code"
+        let request = ApprovalRequest(tool: tool, summary: ApprovalServer.summary(tool, input), project: project)
+        waiting[request.id] = connection
+        // Claude Code waits up to the hook's timeout (120 s); give up a little before that.
+        queue.asyncAfter(deadline: .now() + 110) { [weak self] in
+            guard let self, let connection = self.waiting.removeValue(forKey: request.id) else { return }
+            self.reply(connection, body: "")
+            DispatchQueue.main.async { self.onExpire(request.id) }
+        }
+        DispatchQueue.main.async { self.onRequest(request) }
+    }
+
+    func answer(_ id: UUID, _ answer: ApprovalAnswer) {
+        queue.async {
+            guard let connection = self.waiting.removeValue(forKey: id) else { return }
+            let decision: [String: Any]
+            switch answer {
+            case .allow: decision = ["behavior": "allow"]
+            case .deny: decision = ["behavior": "deny", "message": "Denied from iServer"]
+            case .terminal: return self.reply(connection, body: "")  // no decision: Claude Code asks in the terminal
+            }
+            let output: [String: Any] = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": decision]]
+            let data = (try? JSONSerialization.data(withJSONObject: output)) ?? Data()
+            self.reply(connection, body: String(decoding: data, as: UTF8.self))
+        }
+    }
+
+    private func reply(_ connection: NWConnection, body: String, status: String = "200 OK") {
+        let response = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    static func summary(_ tool: String, _ input: [String: Any]) -> String {
+        if let command = input["command"] as? String { return command }
+        if let file = input["file_path"] as? String { return DevClean.tilde(file) }
+        if let url = input["url"] as? String { return url }
+        if let pattern = input["pattern"] as? String { return pattern }
+        if let prompt = input["description"] as? String { return prompt }
+        return tool
+    }
+}
+
+// Adds or removes iServer's PermissionRequest hook in ~/.claude/settings.json, keeping everything else.
+enum ClaudeHook {
+    static let file = NSHomeDirectory() + "/.claude/settings.json"
+    static var command: String {
+        "curl -sf --max-time 115 -X POST -H 'Content-Type: application/json' --data-binary @- "
+            + "http://127.0.0.1:\(ApprovalServer.port)\(ApprovalServer.path) || true"
+    }
+
+    private static func load() -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: file) else { return [:] }
+        guard let data = FileManager.default.contents(atPath: file) else { return nil }
+        if data.isEmpty { return [:] }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    static var installed: Bool {
+        guard let hooks = load()?["hooks"] as? [String: Any], let entries = hooks["PermissionRequest"] as? [[String: Any]] else { return false }
+        return entries.contains { isOurs($0) }
+    }
+
+    private static func isOurs(_ entry: [String: Any]) -> Bool {
+        (entry["hooks"] as? [[String: Any]] ?? []).contains { ($0["command"] as? String)?.contains(ApprovalServer.path) == true }
+    }
+
+    // Returns an error message, or nil when it worked. A copy of the old file is kept next to it.
+    static func set(_ on: Bool) -> String? {
+        guard var settings = load() else {
+            return L("~/.claude/settings.json couldn't be read as JSON, so it was left alone.",
+                     "~/.claude/settings.json kon niet als JSON gelezen worden en is niet aangepast.")
+        }
+        var hooks = settings["hooks"] as? [String: Any] ?? [:]
+        var entries = (hooks["PermissionRequest"] as? [[String: Any]] ?? []).filter { !isOurs($0) }
+        if on {
+            entries.append(["matcher": "*", "hooks": [["type": "command", "command": command, "timeout": 120]]])
+        }
+        hooks["PermissionRequest"] = entries.isEmpty ? nil : entries
+        settings["hooks"] = hooks.isEmpty ? nil : hooks
+        do {
+            try FileManager.default.createDirectory(atPath: (file as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: file) {
+                let backup = file + ".iserver-backup"
+                try? FileManager.default.removeItem(atPath: backup)
+                try FileManager.default.copyItem(atPath: file, toPath: backup)
+            }
+            let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            try data.write(to: URL(fileURLWithPath: file), options: .atomic)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+}
+
+// The card shown in the notch while Claude Code waits for a decision.
+final class ApprovalCard: NSView {
+    override var isFlipped: Bool { true }
+    var onAnswer: (ApprovalAnswer) -> Void = { _ in }
+    private let title = makeLabel("", size: 13, weight: .semibold, color: .white)
+    private let detail = makeLabel("", size: 11.5, weight: .regular, color: NSColor.white.withAlphaComponent(0.75))
+    private let more = makeLabel("", size: 10.5, weight: .medium, color: NSColor.white.withAlphaComponent(0.5))
+    private lazy var allow = AccentButton { [weak self] in self?.onAnswer(.allow) }
+    private lazy var deny = QuietButton(L("Deny", "Weigeren")) { [weak self] in self?.onAnswer(.deny) }
+    private lazy var terminal = QuietButton(L("In terminal", "In terminal")) { [weak self] in self?.onAnswer(.terminal) }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        detail.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        detail.lineBreakMode = .byTruncatingMiddle
+        detail.cell?.lineBreakMode = .byTruncatingMiddle
+        allow.title = L("Allow", "Toestaan")
+        for view in [title, detail, more, allow, deny, terminal] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+
+    func show(_ request: ApprovalRequest, queued: Int) {
+        title.stringValue = "Claude Code " + L("wants to use", "wil gebruiken") + " \(request.tool)  ·  \(request.project)"
+        detail.stringValue = request.summary
+        detail.toolTip = request.summary
+        more.stringValue = queued > 0 ? L("+\(queued) more waiting", "nog \(queued) wachtend") : ""
+    }
+
+    override func layout() {
+        super.layout()
+        title.frame = NSRect(x: 2, y: 2, width: bounds.width - 4, height: 18)
+        detail.frame = NSRect(x: 2, y: 24, width: bounds.width - 4, height: 16)
+        let y: CGFloat = 50
+        allow.frame = NSRect(x: 0, y: y, width: 96, height: 30)
+        deny.frame = NSRect(x: allow.frame.maxX + 8, y: y + 1, width: 92, height: 28)
+        terminal.frame = NSRect(x: deny.frame.maxX + 8, y: y + 1, width: 110, height: 28)
+        more.frame = NSRect(x: terminal.frame.maxX + 10, y: y + 8, width: max(0, bounds.width - terminal.frame.maxX - 12), height: 14)
+    }
+}
+
+// MARK: - iNotch: controller
+
+// Borderless panels can't become key by default; this one can, so the prompter text can be typed in.
+final class NotchPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+// Owns the island window and everything it shows. Separate from the server menu.
+final class NotchController {
+    private let demo: Bool
+    private var panel: NotchPanel?
+    private let view = NotchView()
+    private let companion = Companion()
+    let prompter = Prompter()
+    private var timers: [Timer] = []
+    private var monitors: [Any] = []
+    private var powerSource: CFRunLoopSource?
+    private var lastPower = PowerInfo()
+    private var warnedLow = false
+    private var toldFull = false
+    private var sessions: [AgentSession] = []
+    private var sessionStates: [String: AgentState] = [:]
+    private var usage: [ProviderUsage] = []
+    private var usageUpdated: Date?
+    private var alerts: [NotchAlert] = []
+    private var alertUntil = Date.distantPast
+    private var hovering = false
+    private var lastMouse = NSPoint.zero
+    private var lastMoved = Date()
+    private var cpu = 0.0
+    private var scanning = false
+    private(set) var enabled = false
+    private let approvals = ApprovalServer()
+    private var pending: [ApprovalRequest] = []
+
+    private var claudeConnected: Bool {
+        get { UserDefaults.standard.bool(forKey: "notchClaudeUsage") }
+        set { UserDefaults.standard.set(newValue, forKey: "notchClaudeUsage") }
+    }
+
+    init(demo: Bool) {
+        self.demo = demo
+        view.companion = companion
+        view.onClick = { [weak self] in self?.toggleOpen() }
+        view.content.onPage = { [weak self] in self?.view.refit() }
+        view.onPip = { [weak self] in
+            guard let self else { return }
+            let all = Companion.Style.allCases
+            let next = all[((all.firstIndex(of: self.companion.style) ?? 0) + 1) % all.count]
+            self.companion.style = next
+            self.companion.react(.happy, for: 1.2)
+        }
+        view.content.usage.onConnectClaude = { [weak self] in
+            self?.claudeConnected = true
+            self?.refreshUsage()
+        }
+        view.content.usage.onRefresh = { [weak self] in self?.refreshUsage() }
+        let page = view.content.prompter
+        page.onText = { [weak self] in self?.prompter.text = $0 }
+        page.onPlay = { [weak self] in
+            guard let self, let screen = self.screen else { return }
+            self.prompter.toggle(below: self.notchRect(on: screen), on: screen)
+            if self.prompter.running { self.collapse() }
+        }
+        page.onReset = { [weak self] in self?.prompter.restart() }
+        page.onSpeed = { [weak self] in self?.prompter.adjust(speed: $0) }
+        page.onSize = { [weak self] in self?.prompter.adjust(size: $0) }
+        prompter.onChange = { [weak self] in self?.showPrompter() }
+        view.content.agents.onHook = { [weak self] in self?.toggleHook() }
+        view.card.onAnswer = { [weak self] in self?.answer($0) }
+        approvals.onRequest = { [weak self] in self?.received($0) }
+        approvals.onExpire = { [weak self] id in self?.expired(id) }
+    }
+
+    // MARK: Turning on and off
+
+    func setEnabled(_ on: Bool) {
+        guard on != enabled else { return }
+        enabled = on
+        on ? start() : stop()
+    }
+
+    private func start() {
+        let panel = NotchPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.ignoresMouseEvents = true
+        panel.contentView = view
+        self.panel = panel
+        place()
+        view.mode = .compact
+        view.settle()
+        panel.orderFrontRegardless()
+
+        // ~30 fps while visible: Pip's animation and the eyes following the cursor.
+        timers.append(repeating(1.0 / 30) { [weak self] in self?.frame() })
+        timers.append(repeating(4) { [weak self] in self?.scanAgents() })
+        timers.append(repeating(600) { [weak self] in self?.refreshUsage() })
+        timers.append(repeating(10) { [weak self] in self?.sampleCPU() })
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+            self?.clickedElsewhere()
+        }) { monitors.append(monitor) }
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        watchPower()
+        approvals.start()
+        view.content.agents.showHook(installed: ClaudeHook.installed)
+        lastPower = PowerInfo.sample()
+        scanAgents()
+        refreshUsage()
+        say(NotchAlert(symbol: "hand.wave.fill", tint: Companion.body, title: L("Hi, I'm Pip!", "Hoi, ik ben Pip!"),
+                       detail: L("Click the notch to open me", "Klik op de notch om me te openen")), mood: .happy)
+    }
+
+    private func stop() {
+        timers.forEach { $0.invalidate() }
+        timers = []
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors = []
+        if let powerSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSource, .defaultMode) }
+        powerSource = nil
+        NotificationCenter.default.removeObserver(self)
+        prompter.stop()
+        approvals.stop()
+        pending.removeAll()
+        panel?.orderOut(nil)
+        panel = nil
+    }
+
+    private func repeating(_ interval: TimeInterval, _ block: @escaping () -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in block() }
+        timer.tolerance = interval * 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
+    // MARK: Geometry
+
+    private var screen: NSScreen? {
+        NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main
+    }
+
+    func notchRect(on screen: NSScreen) -> NSRect {
+        let frame = screen.frame
+        if screen.safeAreaInsets.top > 0,
+           let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+            let width = frame.width - left.width - right.width
+            let height = screen.safeAreaInsets.top
+            return NSRect(x: frame.minX + left.width, y: frame.maxY - height, width: width, height: height)
+        }
+        // No notch: a capsule just below the top edge
+        let height = max(24, NSStatusBar.system.thickness - 2)
+        return NSRect(x: frame.midX - 90, y: frame.maxY - height - 4, width: 180, height: height)
+    }
+
+    private func place() {
+        guard let panel, let screen else { return }
+        let notch = notchRect(on: screen)
+        view.hasNotch = screen.safeAreaInsets.top > 0
+        view.notch = notch.size
+        let width: CGFloat = 760, height: CGFloat = 420
+        let top = view.hasNotch ? screen.frame.maxY : notch.maxY
+        panel.setFrame(NSRect(x: notch.midX - width / 2, y: top - height, width: width, height: height), display: true)
+    }
+
+    @objc private func screensChanged() {
+        place()
+        view.settle()
+    }
+
+    // MARK: Per frame
+
+    private func frame() {
+        guard let panel else { return }
+        let mouse = NSEvent.mouseLocation
+        if mouse != lastMouse {
+            lastMouse = mouse
+            lastMoved = Date()
+        }
+        // Clicks only land on the black shape; everywhere else they pass through to the menu bar and apps.
+        let local = view.convert(panel.convertPoint(fromScreen: mouse), from: nil)
+        let inside = view.shapePath.contains(local)
+        if panel.ignoresMouseEvents == inside { panel.ignoresMouseEvents = !inside }
+        let near = view.shapePath.bounds.insetBy(dx: -6, dy: -6).contains(local)
+        if near != hovering {
+            hovering = near
+            updateMode()
+        }
+        if Date() > alertUntil, view.mode == .alert {
+            if pending.isEmpty { nextAlert() } else { showApproval() }
+        }
+
+        let resting: Companion.Mood
+        if cpu > 90 || (lastPower.hasBattery && !lastPower.pluggedIn && lastPower.level <= 15) {
+            resting = .worried
+        } else if Date().timeIntervalSince(lastMoved) > 300 && !sessions.contains(where: { $0.state == .working }) {
+            resting = .sleepy
+        } else {
+            resting = .idle
+        }
+        companion.tick(resting: resting)
+        // Redraw only the band around the notch (Pip and the wings); the open panel redraws itself when it changes.
+        let shape = view.shapePath.bounds
+        let band = view.mode == .expanded ? NSRect(x: shape.minX, y: shape.maxY - view.notch.height - 8,
+                                                   width: shape.width, height: view.notch.height + 8) : shape.insetBy(dx: -8, dy: -8)
+        view.setNeedsDisplay(band)
+    }
+
+    private func updateMode() {
+        guard view.mode != .alert, view.mode != .expanded, view.mode != .approval else { return }
+        view.setMode(hovering ? .peek : .compact)
+    }
+
+    private func toggleOpen() {
+        if view.mode == .approval { return }  // answer the card first
+        if view.mode == .expanded {
+            collapse()
+        } else {
+            alertUntil = .distantPast
+            alerts.removeAll()
+            showSessions()
+            showUsage()
+            showPrompter()
+            if claudeConnected, (usageUpdated.map { Date().timeIntervalSince($0) > 300 } ?? true) { refreshUsage() }
+            view.setMode(.expanded)
+            companion.react(.happy, for: 1.2)
+        }
+    }
+
+    private func collapse() {
+        view.setMode(hovering ? .peek : .compact)
+    }
+
+    private func clickedElsewhere() {
+        if view.mode == .expanded { collapse() }
+    }
+
+    // MARK: Approvals
+
+    private func received(_ request: ApprovalRequest) {
+        pending.append(request)
+        companion.react(.surprised, for: 3)
+        if pending.count == 1 { showApproval() } else { view.card.show(pending[0], queued: pending.count - 1) }
+    }
+
+    private func showApproval() {
+        guard let first = pending.first else {
+            view.setMode(hovering ? .peek : .compact)
+            if !alerts.isEmpty { nextAlert() }
+            return
+        }
+        view.card.show(first, queued: pending.count - 1)
+        view.setMode(.approval)
+        NSSound(named: "Tink")?.play()
+    }
+
+    private func answer(_ answer: ApprovalAnswer) {
+        guard let first = pending.first else { return }
+        approvals.answer(first.id, answer)
+        pending.removeFirst()
+        companion.react(answer == .allow ? .happy : .idle, for: 1.5)
+        showApproval()
+    }
+
+    private func expired(_ id: UUID) {
+        let wasFirst = pending.first?.id == id
+        pending.removeAll { $0.id == id }
+        if wasFirst { showApproval() }
+    }
+
+    private func toggleHook() {
+        let installed = ClaudeHook.installed
+        collapse()
+        let alert = NSAlert()
+        if installed {
+            alert.messageText = L("Stop approving from the notch?", "Niet meer goedkeuren vanuit de notch?")
+            alert.informativeText = L("iServer's hook is removed from ~/.claude/settings.json; Claude Code asks in the terminal again.",
+                                      "De hook van iServer wordt uit ~/.claude/settings.json gehaald; Claude Code vraagt weer in de terminal.")
+            alert.addButton(withTitle: L("Turn off", "Uitzetten"))
+        } else {
+            alert.messageText = L("Approve Claude Code requests from the notch?", "Claude Code-verzoeken goedkeuren vanuit de notch?")
+            alert.informativeText = L("""
+                iServer adds a PermissionRequest hook to ~/.claude/settings.json (a copy is kept as settings.json.iserver-backup). \
+                When Claude Code asks for permission, the question shows in the notch: Allow, Deny, or answer in the terminal. \
+                If iServer isn't running, Claude Code just asks in the terminal. New Claude Code sessions pick it up.
+                """, """
+                iServer voegt een PermissionRequest-hook toe aan ~/.claude/settings.json (een kopie blijft als settings.json.iserver-backup). \
+                Vraagt Claude Code om toestemming, dan verschijnt de vraag in de notch: Toestaan, Weigeren of in de terminal antwoorden. \
+                Draait iServer niet, dan vraagt Claude Code het gewoon in de terminal. Nieuwe Claude Code-sessies gebruiken het.
+                """)
+            alert.addButton(withTitle: L("Turn on", "Aanzetten"))
+        }
+        alert.addButton(withTitle: L("Cancel", "Annuleer"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let error = ClaudeHook.set(!installed) {
+            let failure = NSAlert()
+            failure.messageText = L("Couldn't change Claude Code's settings", "Instellingen van Claude Code niet aangepast")
+            failure.informativeText = error
+            failure.runModal()
+        }
+        view.content.agents.showHook(installed: ClaudeHook.installed)
+    }
+
+    // MARK: Alerts
+
+    func say(_ alert: NotchAlert, mood: Companion.Mood = .surprised) {
+        guard enabled else { return }
+        companion.react(mood)
+        if view.mode == .expanded { return }  // the open panel already shows everything
+        alerts.append(alert)
+        if view.mode != .alert, view.mode != .approval { nextAlert() }
+    }
+
+    private func nextAlert() {
+        guard !alerts.isEmpty else {
+            view.alert = nil
+            view.setMode(hovering ? .peek : .compact)
+            return
+        }
+        view.alert = alerts.removeFirst()
+        alertUntil = Date().addingTimeInterval(3.2)
+        view.setMode(.alert)
+    }
+
+    func serversChanged(started: [ServerGroup], stopped: [String]) {
+        for group in started.prefix(2) {
+            let port = group.listeners.first.map { ":\($0.port)" } ?? ""
+            say(NotchAlert(symbol: "play.circle.fill", tint: .systemGreen, title: group.title + " " + L("started", "gestart"),
+                           detail: port), mood: .happy)
+        }
+        for name in stopped.prefix(2) {
+            say(NotchAlert(symbol: "stop.circle.fill", tint: .systemGray, title: name + " " + L("stopped", "gestopt"),
+                           detail: L("dev server", "dev server")), mood: .surprised)
+        }
+    }
+
+    func awakeChanged(_ on: Bool) {
+        say(NotchAlert(symbol: on ? "cup.and.saucer.fill" : "moon.zzz.fill", tint: on ? .systemOrange : .systemIndigo,
+                       title: on ? L("Staying awake", "Blijft wakker") : L("Sleep allowed again", "Mag weer slapen"),
+                       detail: on ? L("Mac and display won't sleep", "Mac en scherm slapen niet") : L("Awake is off", "Wakker staat uit")),
+            mood: on ? .happy : .sleepy)
+    }
+
+    // MARK: Power
+
+    private func watchPower() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let source = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<NotchController>.fromOpaque(context).takeUnretainedValue().powerChanged()
+        }, context)?.takeRetainedValue() else { return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        powerSource = source
+    }
+
+    private func powerChanged() {
+        let now = PowerInfo.sample()
+        defer { lastPower = now }
+        guard now.hasBattery else { return }
+        if now.pluggedIn != lastPower.pluggedIn {
+            say(NotchAlert(symbol: now.pluggedIn ? "bolt.fill" : "battery.75percent", tint: now.pluggedIn ? .systemGreen : .white,
+                           title: now.pluggedIn ? L("Charging", "Opladen") : L("On battery", "Op batterij"), detail: "\(now.level)%"),
+                mood: now.pluggedIn ? .happy : .surprised)
+            if now.pluggedIn { warnedLow = false } else { toldFull = false }
+        }
+        if !now.pluggedIn, now.level <= 20, !warnedLow {
+            warnedLow = true
+            say(NotchAlert(symbol: "battery.25percent", tint: .systemRed, title: L("Battery low", "Batterij bijna leeg"),
+                           detail: "\(now.level)%"), mood: .worried)
+        }
+        if now.pluggedIn, now.level >= 100, !toldFull {
+            toldFull = true
+            say(NotchAlert(symbol: "battery.100percent.bolt", tint: .systemGreen, title: L("Fully charged", "Volledig opgeladen"),
+                           detail: "100%"), mood: .happy)
+        }
+    }
+
+    private func sampleCPU() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let load = Vitals.cpuLoad()
+            DispatchQueue.main.async { self?.cpu = load }
+        }
+    }
+
+    // MARK: Agents
+
+    private func scanAgents() {
+        guard !scanning else { return }
+        scanning = true
+        let demo = self.demo
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found = demo ? AgentWatcher.demo() : AgentWatcher.scan()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.scanning = false
+                for session in found where self.sessionStates[session.id] == .working || self.sessionStates[session.id] == .waiting {
+                    if session.state == .done {
+                        self.say(NotchAlert(symbol: "checkmark.circle.fill", tint: .systemGreen,
+                                            title: session.agent + " " + L("finished", "is klaar"), detail: session.project), mood: .happy)
+                    } else if session.state == .waiting, self.sessionStates[session.id] == .working {
+                        self.say(NotchAlert(symbol: "hand.raised.fill", tint: .systemOrange,
+                                            title: session.agent + " " + L("is waiting", "wacht"), detail: session.project), mood: .worried)
+                    }
+                }
+                self.sessionStates = Dictionary(found.map { ($0.id, $0.state) }, uniquingKeysWith: { first, _ in first })
+                self.sessions = found
+                self.showSessions()
+            }
+        }
+    }
+
+    private func showSessions() {
+        let before = view.content.agents.count
+        view.content.agents.show(sessions)
+        if before != sessions.count { view.refit() }
+        let working = sessions.filter { $0.state == .working }.count
+        let waiting = sessions.filter { $0.state == .waiting }.count
+        if waiting > 0 {
+            view.rightDot = .systemOrange
+            view.rightText = "\(waiting) " + L("waiting", "wacht")
+        } else if working > 0 {
+            view.rightDot = .systemBlue
+            view.rightText = working == 1 ? L("1 agent working", "1 agent bezig") : "\(working) " + L("agents working", "agents bezig")
+        } else {
+            view.rightDot = nil
+            view.rightText = usageHeadline
+        }
+        view.leftText = usageSummary
+        view.claudeUsage = usage.first { $0.name == "Claude" }.flatMap { $0.fiveHour ?? $0.weekly }?.used
+        view.codexUsage = usage.first { $0.name == "Codex" }.flatMap { $0.fiveHour ?? $0.weekly }?.used
+    }
+
+    // MARK: Usage
+
+    private var usageHeadline: String? {
+        guard let window = usage.first(where: { $0.fiveHour != nil })?.fiveHour else { return nil }
+        return "\(Int((window.used * 100).rounded()))%"
+    }
+
+    // The provider closest to its 5-hour limit; there's only room for one beside the notch.
+    private var usageSummary: String? {
+        let readings = usage.compactMap { provider -> (String, Double)? in
+            guard let window = provider.fiveHour ?? provider.weekly else { return nil }
+            return (provider.name, window.used)
+        }
+        guard let top = readings.max(by: { $0.1 < $1.1 }) else { return nil }
+        return "\(top.0) \(Int((top.1 * 100).rounded()))%"
+    }
+
+    func refreshUsage() {
+        let demo = self.demo
+        let claude = claudeConnected
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found: [ProviderUsage] = demo ? AIUsage.demo() : [claude ? AIUsage.claude() : nil, AIUsage.codex()].compactMap { $0 }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let previous = self.usage
+                self.usage = found
+                self.usageUpdated = Date()
+                for provider in found {
+                    guard let now = provider.fiveHour, now.used >= 0.9,
+                          (previous.first { $0.name == provider.name }?.fiveHour?.used ?? 0) < 0.9 else { continue }
+                    self.say(NotchAlert(symbol: "gauge.with.dots.needle.100percent", tint: .systemOrange,
+                                        title: provider.name + " " + L("almost at its limit", "bijna aan de limiet"),
+                                        detail: "\(Int(now.used * 100))% " + L("of 5 hours", "van 5 uur")), mood: .worried)
+                }
+                self.showUsage()
+                self.showSessions()
+            }
+        }
+    }
+
+    private func showUsage() {
+        view.content.usage.show(usage, claudeConnected: claudeConnected || demo, updated: usageUpdated)
+    }
+
+    private func showPrompter() {
+        view.content.prompter.show(text: prompter.text, running: prompter.running, speed: prompter.speed, size: prompter.size)
     }
 }
 
@@ -4899,7 +6934,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var scanning = false
     private var trace = Trace()
     private var cpuHistory: [Int32: [Double]] = [:]  // per server group, newest last
-    private var menuCPU: [Double] = []  // system CPU 0...1 for the menu bar graph, newest last
+    private var menuCPU: [Double] = []
+    private lazy var notch = NotchController(demo: demo)
+    private var notchEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "notchEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "notchEnabled") }
+    }  // system CPU 0...1 for the menu bar graph, newest last
     private var chartTimer: Timer?
     private var charting = false
     private var activityTicks = 0
@@ -4925,9 +6965,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         board.stop = { [weak self] in self?.stopGroup($0) }
         board.setApps = { [weak self] in self?.setIncludeApps($0) }
         board.setLogin = { [weak self] in self?.setLogin($0) }
+        board.setNotch = { [weak self] on in
+            guard let self else { return }
+            self.notchEnabled = on
+            self.notch.setEnabled(on)
+            self.board.notchOn = on
+        }
         board.setAwake = { [weak self] on in
             guard let self else { return }
             Awake.set(on)
+            self.notch.awakeChanged(Awake.isOn)
             self.board.setToggles(apps: self.includeApps, login: SMAppService.mainApp.status == .enabled)
         }
         board.quit = { NSApp.terminate(nil) }
@@ -4988,6 +7035,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateButton()
         refresh()
         scheduleRefresh()
+        if notchEnabled || CommandLine.arguments.contains("--notch") {
+            notch.setEnabled(true)
+            board.notchOn = true
+        }
         let clipTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.clips.poll() }
         clipTimer.tolerance = 1
         let cpuTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.sampleMenuCPU() }
@@ -5117,6 +7168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let volumes = visible ? Disks.mounted() : nil
             DispatchQueue.main.async {
                 self.scanning = false
+                let before = self.groups
                 self.groups = result
                 self.recordHistory(result)
                 if let vitals {
@@ -5128,6 +7180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 // Uptime and load are not part of the signature: refreshStats updates those in place.
                 let signature = result.map(\.signature).joined(separator: ";")
                 let changed = signature != self.lastSignature
+                // Servers that started or stopped since the last scan (not on the very first one).
+                if changed, !self.lastSignature.isEmpty {
+                    let old = Set(before.map(\.id)), new = Set(result.map(\.id))
+                    self.notch.serversChanged(started: result.filter { !old.contains($0.id) },
+                                              stopped: before.filter { !new.contains($0.id) }.map(\.title))
+                }
                 if changed {
                     self.lastSignature = signature
                     self.updateButton()
