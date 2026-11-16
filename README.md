@@ -43,7 +43,7 @@
 - 📊 **Summary bar**: number of dev servers, plus CPU, RAM and disk gauges that turn orange and red as they fill up
 - ⚡ **Activity**: large CPU, GPU and memory gauges, a history chart, battery (level, health, cycles, charging) and thermal state, and every app and process with its CPU and memory; helpers are counted under their app. Search, sort, and quit or force quit your own apps and processes
 - 💾 **Storage**: used and free space per volume, plus five tools (see below)
-- 📋 **Clipboard history**: search (just start typing) and re-copy recent text, links and files, and pin what you want to keep. Anything a password manager marks as private is skipped, and only pinned clips are saved to disk
+- 📋 **Clipboard history**: text, links, files, images (with thumbnails), colours (with a swatch) and code. Search (just start typing), filter by kind, pin what you want to keep, remove single items or clear the history. Anything a password manager marks as private is skipped, and only pinned clips are saved to disk
 - 🖥️ **Menu bar graph**: the icon is a live mini CPU graph
 - ☕ **Stay awake**: the **Awake** toggle keeps your Mac and display from sleeping, like [KeepingYouAwake](https://github.com/newmarcel/KeepingYouAwake)
 
@@ -52,7 +52,7 @@
 Everything is moved to the Trash after you confirm, so you can put it back. Only Docker cleanup and emptying the Trash are permanent, and those are never preselected. Scans only start when you press **Scan**.
 
 - 🧹 **Cleanup**: package caches (npm, pnpm, Yarn, Bun, pip, uv, Homebrew, CocoaPods, Gradle, Cargo, Go), Xcode (DerivedData, simulator caches, DeviceSupport, Archives), Docker (unused images, stopped containers, build cache) and project leftovers like `node_modules`, `.next`, `target`, `Pods` and `.venv`. Projects untouched for 30 days are preselected, projects with a running server never are. Search and sort projects by size, age or name
-- 🧭 **Explorer**: your home folder by size, biggest first; click into folders, reveal in Finder or move to the Trash
+- 🧭 **Explorer**: press Scan to measure your home folder, biggest first; click into folders, reveal in Finder or move to the Trash
 - 📦 **Large**: files over 100 MB, or over 10 MB and untouched for a year, in Downloads, Desktop, Documents, Movies, Music and Pictures
 - 🗑️ **Apps**: remove an app together with its caches, preferences, containers and launch agents; running apps are locked and Apple's apps are left out. Also lists leftovers of apps you already deleted (cautious matching, worth a look before removing)
 - 👯 **Duplicates**: files with identical content (size, samples, then SHA-256); the oldest copy is always kept. Files that only live in iCloud are skipped, so nothing gets downloaded

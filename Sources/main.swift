@@ -1225,11 +1225,38 @@ struct PowerInfo {
 
 struct ClipItem: Codable, Equatable {
     var id: UUID
-    var text: String
-    var kind: String
+    var text: String        // the text, link, file path, colour, or "1200 × 800" for an image
+    var kind: String        // text, code, link, color, file, image
     var app: String
     var date: Date
     var pinned: Bool
+    var digest: String? = nil  // images: SHA-256 of the PNG, to spot the same image copied twice
+}
+
+// Parses "#abc", "#aabbcc", "#aabbccdd", "rgb(1, 2, 3)" and "rgba(1, 2, 3, 0.5)".
+func parseColor(_ text: String) -> NSColor? {
+    let value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if value.hasPrefix("#") {
+        var hex = String(value.dropFirst())
+        guard [3, 6, 8].contains(hex.count), hex.allSatisfy(\.isHexDigit) else { return nil }
+        if hex.count == 3 { hex = hex.map { "\($0)\($0)" }.joined() }
+        guard let number = UInt64(hex, radix: 16) else { return nil }
+        let hasAlpha = hex.count == 8
+        let r = Double((number >> (hasAlpha ? 24 : 16)) & 0xff) / 255
+        let g = Double((number >> (hasAlpha ? 16 : 8)) & 0xff) / 255
+        let b = Double((number >> (hasAlpha ? 8 : 0)) & 0xff) / 255
+        let a = hasAlpha ? Double(number & 0xff) / 255 : 1
+        return NSColor(srgbRed: r, green: g, blue: b, alpha: a)
+    }
+    for prefix in ["rgba(", "rgb("] where value.hasPrefix(prefix) && value.hasSuffix(")") {
+        let parts = value.dropFirst(prefix.count).dropLast().split(separator: ",").map {
+            Double($0.trimmingCharacters(in: .whitespaces)) ?? -1
+        }
+        guard (3...4).contains(parts.count), parts.prefix(3).allSatisfy({ (0...255).contains($0) }) else { return nil }
+        return NSColor(srgbRed: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255,
+                       alpha: parts.count == 4 ? min(1, max(0, parts[3])) : 1)
+    }
+    return nil
 }
 
 final class ClipBook {
@@ -1239,21 +1266,34 @@ final class ClipBook {
     private var seenChange = NSPasteboard.general.changeCount
     private var sourceApp = ""
     private let file: URL
+    private let imageDir: URL
+    private var images: [UUID: Data] = [:]  // PNG; only pinned images are written to disk
+    private var thumbnails: [UUID: NSImage] = [:]
+    private static let maxLoose = 40
+    private static let maxImages = 15
+    private static let maxImageBytes = 25_000_000
 
     init() {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iServer", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        imageDir = dir.appendingPathComponent("images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
         file = dir.appendingPathComponent("clips.json")
         if let data = try? Data(contentsOf: file),
            let saved = try? JSONDecoder().decode([ClipItem].self, from: data) {
             items = saved.filter(\.pinned)
+            for item in items where item.kind == "image" {
+                images[item.id] = try? Data(contentsOf: imageFile(item.id))
+            }
+            items.removeAll { $0.kind == "image" && images[$0.id] == nil }
             if items.count != saved.count { store() }  // scrub unpinned history written by older versions
         }
         noteFrontmost()
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appActivated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
     }
+
+    private func imageFile(_ id: UUID) -> URL { imageDir.appendingPathComponent(id.uuidString + ".png") }
 
     func poll() {
         let board = NSPasteboard.general
@@ -1270,19 +1310,55 @@ final class ClipBook {
             remember(path, kind: "file")
             return
         }
-        guard let text = board.string(forType: .string) else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 50_000 else { return }
-        let kind = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")) ? "link" : "text"
-        remember(String(trimmed.prefix(50_000)), kind: kind)
+        if let text = board.string(forType: .string) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.count <= 50_000 else { return }
+            remember(trimmed, kind: ClipBook.classify(trimmed))
+            return
+        }
+        if let data = board.data(forType: .png) ?? board.data(forType: .tiff), data.count <= ClipBook.maxImageBytes,
+           let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) {
+            rememberImage(png)
+        }
     }
+
+    static func classify(_ text: String) -> String {
+        if !text.contains(where: \.isWhitespace), text.hasPrefix("http://") || text.hasPrefix("https://") { return "link" }
+        if parseColor(text) != nil { return "color" }
+        return looksLikeCode(text) ? "code" : "text"
+    }
+
+    // Several lines with the punctuation and keywords code is full of.
+    static func looksLikeCode(_ text: String) -> Bool {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        guard lines.count >= 2 else { return false }
+        let markers = ["{", "}", ";", "=>", "->", "func ", "def ", "const ", "let ", "var ", "import ", "return ",
+                       "</", "#include", "class ", "if (", "if ", "fn ", "$ ", "npm ", "git "]
+        let hits = markers.filter { text.contains($0) }.count
+        let indented = lines.filter { $0.hasPrefix("  ") || $0.hasPrefix("\t") }.count
+        return hits >= 3 || (hits >= 2 && indented >= 1)
+    }
+
+    func image(_ item: ClipItem) -> NSImage? {
+        if let cached = thumbnails[item.id] { return cached }
+        guard let data = images[item.id], let image = NSImage(data: data) else { return nil }
+        thumbnails[item.id] = image
+        return image
+    }
+
+    func imageBytes(_ item: ClipItem) -> Int { images[item.id]?.count ?? 0 }
 
     func copy(_ item: ClipItem) {
         let board = NSPasteboard.general
         board.clearContents()
-        if item.kind == "file" {
+        switch item.kind {
+        case "file":
             board.writeObjects([URL(fileURLWithPath: item.text) as NSURL])
-        } else {
+        case "image":
+            guard let png = images[item.id] else { return }
+            board.setData(png, forType: .png)
+            if let tiff = NSImage(data: png)?.tiffRepresentation { board.setData(tiff, forType: .tiff) }
+        default:
             board.setString(item.text, forType: .string)
         }
         suppressChange = board.changeCount
@@ -1300,23 +1376,86 @@ final class ClipBook {
     func togglePin(_ id: UUID) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].pinned.toggle()
-        items.sort { lhs, rhs in
-            if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
-            return lhs.date > rhs.date
+        if items[index].kind == "image" {
+            if items[index].pinned {
+                try? images[id]?.write(to: imageFile(id), options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: imageFile(id))
+            }
         }
+        sortPinnedFirst()
         store()
         onChange()
     }
 
+    func remove(_ id: UUID) {
+        if items.first(where: { $0.id == id })?.pinned == true { try? FileManager.default.removeItem(at: imageFile(id)) }
+        items.removeAll { $0.id == id }
+        forget([id])
+        store()
+        onChange()
+    }
+
+    // Removes everything that isn't pinned.
+    func clearHistory() {
+        let loose = items.filter { !$0.pinned }.map(\.id)
+        items.removeAll { !$0.pinned }
+        forget(loose)
+        onChange()
+    }
+
+    private func forget(_ ids: [UUID]) {
+        for id in ids {
+            images[id] = nil
+            thumbnails[id] = nil
+        }
+    }
+
+    private func sortPinnedFirst() {
+        items.sort { lhs, rhs in
+            if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
+            return lhs.date > rhs.date
+        }
+    }
+
     private func remember(_ text: String, kind: String) {
-        if items.contains(where: { $0.text == text && $0.pinned }) { return }
-        items.removeAll { $0.text == text && !$0.pinned }
-        let clip = ClipItem(id: UUID(), text: text, kind: kind, app: sourceApp, date: Date(), pinned: false)
+        if items.contains(where: { $0.text == text && $0.pinned && $0.kind != "image" }) { return }
+        let duplicates = items.filter { $0.text == text && !$0.pinned && $0.kind != "image" }.map(\.id)
+        items.removeAll { duplicates.contains($0.id) }
+        insert(ClipItem(id: UUID(), text: text, kind: kind, app: sourceApp, date: Date(), pinned: false))
+    }
+
+    private func rememberImage(_ png: Data) {
+        let digest = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined()
+        if items.contains(where: { $0.digest == digest && $0.pinned }) { return }
+        let duplicates = items.filter { $0.digest == digest }.map(\.id)
+        items.removeAll { duplicates.contains($0.id) }
+        forget(duplicates)
+        let rep = NSBitmapImageRep(data: png)
+        let size = "\(rep?.pixelsWide ?? 0) × \(rep?.pixelsHigh ?? 0)"
+        let clip = ClipItem(id: UUID(), text: size, kind: "image", app: sourceApp, date: Date(), pinned: false, digest: digest)
+        images[clip.id] = png
+        insert(clip)
+    }
+
+    // Newest unpinned item goes right after the pinned ones; old history and extra images fall off.
+    private func insert(_ clip: ClipItem) {
         let pinCount = items.filter(\.pinned).count
         items.insert(clip, at: min(pinCount, items.count))
         var loose = items.filter { !$0.pinned }
-        if loose.count > 40 { loose = Array(loose.prefix(40)) }
+        var dropped: [UUID] = []
+        if loose.count > ClipBook.maxLoose {
+            dropped += loose.dropFirst(ClipBook.maxLoose).map(\.id)
+            loose = Array(loose.prefix(ClipBook.maxLoose))
+        }
+        let looseImages = loose.filter { $0.kind == "image" }
+        if looseImages.count > ClipBook.maxImages {
+            let extra = Set(looseImages.dropFirst(ClipBook.maxImages).map(\.id))
+            dropped += extra
+            loose.removeAll { extra.contains($0.id) }
+        }
         items = items.filter(\.pinned) + loose
+        forget(dropped)
         store()
         onChange()
     }
@@ -1739,9 +1878,6 @@ enum Metrics {
     static let inset: CGFloat = 12
     static var chrome: CGFloat { header + footer }
 
-    static func clipHeight(count: Int) -> CGFloat {
-        46 + CGFloat(max(count, 1)) * clip + listPad * 2
-    }
 
     static func listHeight(count: Int, maxHeight: CGFloat) -> CGFloat {
         let natural = count == 0 ? empty : listPad * 2 + CGFloat(count) * row
@@ -3740,7 +3876,12 @@ final class ExplorerRow: HoverView {
 
 final class ExplorerHeader: NSView {
     var onBack: () -> Void = {}
+    var onScan: () -> Void = {}
     private lazy var back = IconButton(symbol: "chevron.left", help: L("Back", "Terug")) { [weak self] in self?.onBack() }
+    private lazy var scan = AccentButton { [weak self] in self?.onScan() }
+    private lazy var rescan = IconButton(symbol: "arrow.clockwise", help: L("Measure this folder again", "Meet deze map opnieuw")) {
+        [weak self] in self?.onScan()
+    }
     private let spinner = NSProgressIndicator()
     private var title = ""
     private var subtitle = ""
@@ -3750,16 +3891,21 @@ final class ExplorerHeader: NSView {
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
+        scan.title = L("Scan", "Scannen")
         addSubview(back)
+        addSubview(scan)
+        addSubview(rescan)
         addSubview(spinner)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func set(title: String, subtitle: String, canGoBack: Bool, busy: Bool) {
+    func set(title: String, subtitle: String, canGoBack: Bool, busy: Bool, started: Bool) {
         self.title = title
         self.subtitle = subtitle
         back.isHidden = !canGoBack
+        scan.isHidden = started
+        rescan.isHidden = !started || busy
         if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         needsDisplay = true
     }
@@ -3771,6 +3917,9 @@ final class ExplorerHeader: NSView {
         let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
         back.frame = NSRect(x: card.minX + 10, y: card.midY - 13, width: 26, height: 26)
         spinner.frame = NSRect(x: card.maxX - 30, y: card.midY - 8, width: 16, height: 16)
+        rescan.frame = NSRect(x: card.maxX - 38, y: card.midY - 12, width: 26, height: 24)
+        let width = scan.preferredWidth
+        scan.frame = NSRect(x: card.maxX - 12 - width, y: card.midY - 14, width: width, height: 28)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -3780,10 +3929,11 @@ final class ExplorerHeader: NSView {
         Draw.tile("chart.pie.fill", in: NSRect(x: tileX, y: card.midY - 15, width: 30, height: 30), color: Term.accent)
         let x = tileX + 40
         let attrs: [NSAttributedString.Key: Any] = [.font: termFont(13, .semibold), .foregroundColor: Term.ink]
-        (title as NSString).draw(with: NSRect(x: x, y: card.midY + 1, width: card.maxX - 40 - x, height: 17),
+        let textWidth = (scan.isHidden ? card.maxX - 40 : scan.frame.minX - 8) - x
+        (title as NSString).draw(with: NSRect(x: x, y: card.midY + 1, width: textWidth, height: 17),
                                  options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
         let subAttrs: [NSAttributedString.Key: Any] = [.font: digitFont(11, .regular), .foregroundColor: Term.dim]
-        (subtitle as NSString).draw(with: NSRect(x: x, y: card.midY - 15, width: card.maxX - 40 - x, height: 15),
+        (subtitle as NSString).draw(with: NSRect(x: x, y: card.midY - 15, width: textWidth, height: 15),
                                     options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: subAttrs)
     }
 }
@@ -3818,8 +3968,13 @@ final class ExplorerView: NSView {
             guard let self else { return }
             self.open((self.path as NSString).deletingLastPathComponent)
         }
+        header.onScan = { [weak self] in self?.scan() }
         addSubview(header)
         addSubview(placeholder)
+        placeholder.stringValue = L("Press Scan to measure your home folder", "Druk op Scannen om je thuismap te meten")
+        header.set(title: L("Space explorer", "Ruimteverkenner"),
+                   subtitle: L("See what takes up space in your home folder", "Zie wat ruimte inneemt in je thuismap"),
+                   canGoBack: false, busy: false, started: false)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -3828,10 +3983,14 @@ final class ExplorerView: NSView {
         Metrics.cleanHeader + CGFloat(max(rows.count, 1)) * Metrics.explorerRow + Metrics.listPad * 2
     }
 
-    func start() {
-        guard !started else { return }
+    // The first press measures the home folder; after that it measures the current folder again.
+    private func scan() {
+        if started {
+            sizes = sizes.filter { !$0.key.hasPrefix(path + "/") }
+        }
         started = true
-        open(home)
+        placeholder.stringValue = L("Empty folder", "Lege map")
+        open(started ? path : home)
     }
 
     private func open(_ target: String) {
@@ -3906,7 +4065,7 @@ final class ExplorerView: NSView {
         let name = path == home ? L("Home folder", "Thuismap") : (path as NSString).lastPathComponent
         var subtitle = DevClean.tilde(path) + "  ·  " + Scanner.formatBytes(total)
         if pending > 0 { subtitle += "  ·  " + L("measuring \(pending)…", "\(pending) meten…") }
-        header.set(title: name, subtitle: subtitle, canGoBack: path != home && path.hasPrefix(home), busy: pending > 0)
+        header.set(title: name, subtitle: subtitle, canGoBack: path != home && path.hasPrefix(home), busy: pending > 0, started: true)
     }
 
     private func trash(_ entry: ExplorerRow.Entry) {
@@ -4054,7 +4213,6 @@ final class StoragePane: NSView {
         mode = index
         if current.superview == nil { addSubview(current) }
         for view in [explorer] + lists as [NSView] where view !== current { view.removeFromSuperview() }
-        if mode == 1 { explorer.start() }
         contentChanged()
     }
 
@@ -4091,57 +4249,68 @@ final class StoragePane: NSView {
 // MARK: - Clipboard
 
 final class ClipRow: HoverView {
+    private let clip: ClipItem
+    private let image: NSImage?
+    private let color: NSColor?
     private let preview: NSTextField
     private let meta: NSTextField
     private let pin: IconButton
-    private let pinned: Bool
-    private let symbol: String
-    private let color: NSColor
+    private let delete: IconButton
 
-    init(clip: ClipItem, copy: @escaping () -> Void, toggle: @escaping () -> Void) {
-        let oneLine = clip.text.replacingOccurrences(of: "\n", with: " ")
-        preview = makeLabel(oneLine, size: 12, weight: .medium, color: Term.ink)
-        let when = ClipRow.ago(clip.date)
+    init(clip: ClipItem, image: NSImage?, bytes: Int, copy: @escaping () -> Void, toggle: @escaping () -> Void,
+         delete deleteAction: @escaping () -> Void) {
+        self.clip = clip
+        self.image = image
+        color = clip.kind == "color" ? parseColor(clip.text) : nil
         let what: String
+        var text = clip.text.replacingOccurrences(of: "\n", with: " ")
         switch clip.kind {
-        case "link":
-            what = L("Link", "Link"); symbol = "link"; color = .systemBlue
-        case "file":
-            what = L("File", "Bestand"); symbol = "doc.fill"; color = .systemOrange
-        default:
-            what = L("Text", "Tekst"); symbol = "text.alignleft"; color = .systemGray
+        case "link": what = L("Link", "Link")
+        case "file": what = L("File", "Bestand")
+        case "image":
+            what = L("Image", "Afbeelding")
+            text = L("Image", "Afbeelding") + "  ·  " + clip.text + (bytes > 0 ? "  ·  " + Scanner.formatBytes(UInt64(bytes)) : "")
+        case "color": what = L("Colour", "Kleur")
+        case "code":
+            what = L("Code", "Code")
+            text = clip.text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: "  ")
+        default: what = L("Text", "Tekst")
         }
+        preview = makeLabel(text, size: 12, weight: .medium, color: Term.ink)
+        if clip.kind == "code" || clip.kind == "color" { preview.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium) }
         let who = clip.app.isEmpty ? what : "\(what)  ·  \(clip.app)"
-        meta = makeLabel("\(who)  ·  \(when)", size: 10, weight: .regular, color: Term.dim)
-        pinned = clip.pinned
-        pin = IconButton(symbol: clip.pinned ? "pin.fill" : "pin", help: L("Pin", "Vastzetten"), action: toggle)
+        meta = makeLabel("\(who)  ·  \(ClipRow.ago(clip.date))", size: 10, weight: .regular, color: Term.dim)
+        pin = IconButton(symbol: clip.pinned ? "pin.fill" : "pin", help: clip.pinned ? L("Unpin", "Losmaken") : L("Pin", "Vastzetten"),
+                         action: toggle)
+        delete = IconButton(symbol: "trash", help: L("Remove", "Verwijder"), destructive: true, action: deleteAction)
         super.init(frame: .zero)
         onClick = copy
-        toolTip = clip.text
-        pin.isHidden = !pinned
-        addSubview(preview)
-        addSubview(meta)
-        addSubview(pin)
+        toolTip = clip.kind == "image" ? nil : String(clip.text.prefix(2000))
+        for view in [preview, meta, pin, delete] as [NSView] { addSubview(view) }
+        pin.isHidden = !clip.pinned
+        delete.isHidden = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func refresh() {
         super.refresh()
-        pin.isHidden = !(pinned || hovered)
+        pin.isHidden = !(clip.pinned || hovered)
+        delete.isHidden = !hovered
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: superview)
         guard bounds.contains(local) else { return nil }
-        if !pin.isHidden, pin.frame.contains(local) { return pin }
+        for button in [pin, delete] where !button.isHidden && button.frame.contains(local) { return button }
         return self
     }
 
     override func layout() {
         super.layout()
-        pin.frame = NSRect(x: bounds.width - Metrics.inset - 36, y: (bounds.height - 26) / 2, width: 28, height: 26)
-        let left = Metrics.inset + 50
+        delete.frame = NSRect(x: bounds.width - Metrics.inset - 32, y: (bounds.height - 24) / 2, width: 26, height: 24)
+        pin.frame = NSRect(x: delete.frame.minX - 28, y: (bounds.height - 24) / 2, width: 26, height: 24)
+        let left = Metrics.inset + 52
         preview.frame = NSRect(x: left, y: bounds.height / 2 + 1, width: max(40, pin.frame.minX - left - 6), height: 16)
         meta.frame = NSRect(x: left, y: bounds.height / 2 - 15, width: preview.frame.width, height: 13)
     }
@@ -4150,7 +4319,34 @@ final class ClipRow: HoverView {
         if hovered || pressed {
             Draw.card(bounds.insetBy(dx: Metrics.inset, dy: 2), hot: true, radius: 12)
         }
-        Draw.tile(symbol, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 15, width: 30, height: 30), color: color)
+        let tile = NSRect(x: Metrics.inset + 10, y: bounds.midY - 16, width: 32, height: 32)
+        if let image {
+            // Thumbnail, filled into a rounded square
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: tile, xRadius: 8, yRadius: 8).addClip()
+            let size = image.size
+            let scale = max(tile.width / max(size.width, 1), tile.height / max(size.height, 1))
+            let drawn = NSSize(width: size.width * scale, height: size.height * scale)
+            image.draw(in: NSRect(x: tile.midX - drawn.width / 2, y: tile.midY - drawn.height / 2, width: drawn.width, height: drawn.height))
+            NSGraphicsContext.restoreGraphicsState()
+            Term.stroke.setStroke()
+            NSBezierPath(roundedRect: tile.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+        } else if let color {
+            color.setFill()
+            NSBezierPath(roundedRect: tile.insetBy(dx: 2, dy: 2), xRadius: 14, yRadius: 14).fill()
+            Term.stroke.setStroke()
+            NSBezierPath(roundedRect: tile.insetBy(dx: 2.5, dy: 2.5), xRadius: 14, yRadius: 14).stroke()
+        } else {
+            let (symbol, tint): (String, NSColor) = {
+                switch clip.kind {
+                case "link": return ("link", .systemBlue)
+                case "file": return ("doc.fill", .systemOrange)
+                case "code": return ("chevron.left.forwardslash.chevron.right", .systemGreen)
+                default: return ("text.alignleft", .systemGray)
+                }
+            }()
+            Draw.tile(symbol, in: tile.insetBy(dx: 1, dy: 1), color: tint)
+        }
     }
 
     private static func ago(_ date: Date) -> String {
@@ -4167,12 +4363,23 @@ final class ClipPane: NSView, NSTextFieldDelegate {
     override var isFlipped: Bool { true }
     var onCopy: (ClipItem) -> Void = { _ in }
     var onPin: (ClipItem) -> Void = { _ in }
+    var onDelete: (ClipItem) -> Void = { _ in }
+    var onClear: () -> Void = {}
     var onFilter: () -> Void = {}
+    var imageFor: (ClipItem) -> NSImage? = { _ in nil }
+    var bytesFor: (ClipItem) -> Int = { _ in 0 }
     private let field = NSTextField()
+    private let filters = ModeBar(titles: [L("All", "Alles"), L("Text", "Tekst"), L("Links", "Links"),
+                                           L("Images", "Beeld"), L("Files", "Bestand"), L("Pinned", "Vast")])
     private let empty = makeLabel(L("Clipboard is empty", "Klembord is leeg"), size: 13, weight: .semibold, color: Term.dim)
+    private let pinnedLabel = makeLabel(L("Pinned", "Vastgezet"), size: 11, weight: .semibold, color: Term.dim)
+    private let recentLabel = makeLabel(L("Recent", "Recent"), size: 11, weight: .semibold, color: Term.dim)
+    private lazy var clear = QuietButton(L("Clear history", "Geschiedenis wissen")) { [weak self] in self?.onClear() }
     private var all: [ClipItem] = []
     private var rows: [ClipRow] = []
-    private(set) var shown = 0
+    private var pinnedCount = 0
+    private var filter = 0
+    private static let sectionHeight: CGFloat = 26
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -4184,9 +4391,13 @@ final class ClipPane: NSView, NSTextFieldDelegate {
         field.placeholderString = L("Search clipboard", "Zoek in klembord")
         field.delegate = self
         empty.alignment = .center
-        empty.isHidden = true
-        addSubview(field)
-        addSubview(empty)
+        filters.onSelect = { [weak self] index in
+            guard let self else { return }
+            self.filter = index
+            self.rebuild()
+            self.onFilter()
+        }
+        for view in [field, filters, empty, pinnedLabel, recentLabel, clear] as [NSView] { addSubview(view) }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -4219,19 +4430,50 @@ final class ClipPane: NSView, NSTextFieldDelegate {
 
     var isEditing: Bool { window?.firstResponder === field.currentEditor() }
 
+    private var showsSections: Bool { filter != 5 && pinnedCount > 0 && rows.count > pinnedCount }
+    private var hasLoose: Bool { all.contains { !$0.pinned } }
+
+    var contentHeight: CGFloat {
+        var height: CGFloat = 46 + 40
+        height += rows.isEmpty ? 60 : CGFloat(rows.count) * Metrics.clip
+        if showsSections { height += ClipPane.sectionHeight * 2 }
+        if hasLoose && filter != 5 { height += 44 }
+        return height + Metrics.listPad * 2
+    }
+
+    private func matches(_ clip: ClipItem) -> Bool {
+        switch filter {
+        case 1: return ["text", "code", "color"].contains(clip.kind)
+        case 2: return clip.kind == "link"
+        case 3: return clip.kind == "image"
+        case 4: return clip.kind == "file"
+        case 5: return clip.pinned
+        default: return true
+        }
+    }
+
     private func rebuild() {
         rows.forEach { $0.removeFromSuperview() }
         let query = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let shownItems = query.isEmpty ? all : all.filter {
-            $0.text.lowercased().contains(query) || $0.app.lowercased().contains(query) || $0.kind.contains(query)
+        let shown = all.filter(matches).filter {
+            query.isEmpty || $0.text.lowercased().contains(query) || $0.app.lowercased().contains(query) || $0.kind.contains(query)
         }
-        rows = shownItems.map { clip in
-            ClipRow(clip: clip, copy: { [weak self] in self?.onCopy(clip) }, toggle: { [weak self] in self?.onPin(clip) })
+        // Pinned first, then the rest by time (the store keeps that order already).
+        rows = shown.map { clip in
+            ClipRow(clip: clip, image: imageFor(clip), bytes: bytesFor(clip),
+                    copy: { [weak self] in self?.onCopy(clip) },
+                    toggle: { [weak self] in self?.onPin(clip) },
+                    delete: { [weak self] in self?.onDelete(clip) })
         }
+        pinnedCount = shown.filter(\.pinned).count
         rows.forEach(addSubview)
-        shown = shownItems.count
-        empty.isHidden = shown != 0
+        empty.stringValue = all.isEmpty ? L("Clipboard is empty", "Klembord is leeg") : L("Nothing matches", "Niets gevonden")
+        empty.isHidden = !rows.isEmpty
+        pinnedLabel.isHidden = !showsSections
+        recentLabel.isHidden = !showsSections
+        clear.isHidden = !(hasLoose && filter != 5)
         needsLayout = true
+        needsDisplay = true
     }
 
     private var searchRect: NSRect { NSRect(x: Metrics.inset, y: 6, width: bounds.width - Metrics.inset * 2, height: 30) }
@@ -4240,12 +4482,23 @@ final class ClipPane: NSView, NSTextFieldDelegate {
         super.layout()
         let search = searchRect
         field.frame = NSRect(x: search.minX + 32, y: search.minY + 7, width: search.width - 44, height: 17)
-        empty.frame = NSRect(x: 16, y: 64, width: max(0, bounds.width - 32), height: 16)
-        var y: CGFloat = 46
-        for row in rows {
+        filters.frame = NSRect(x: 0, y: 44, width: bounds.width, height: 36)
+        var y: CGFloat = 86
+        empty.frame = NSRect(x: 16, y: y + 20, width: max(0, bounds.width - 32), height: 16)
+        for (index, row) in rows.enumerated() {
+            if showsSections && index == 0 {
+                pinnedLabel.frame = NSRect(x: Metrics.inset + 6, y: y + 8, width: 200, height: 14)
+                y += ClipPane.sectionHeight
+            }
+            if showsSections && index == pinnedCount {
+                recentLabel.frame = NSRect(x: Metrics.inset + 6, y: y + 8, width: 200, height: 14)
+                y += ClipPane.sectionHeight
+            }
             row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.clip)
             y += Metrics.clip
         }
+        if rows.isEmpty { y += 60 }
+        clear.frame = NSRect(x: (bounds.width - 150) / 2, y: y + 10, width: 150, height: 26)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -4277,6 +4530,10 @@ final class BoardView: NSView {
     var quitProcess: (AppUsage) -> Void = { _ in }
     var copyClip: (ClipItem) -> Void = { _ in }
     var pinClip: (ClipItem) -> Void = { _ in }
+    var deleteClip: (ClipItem) -> Void = { _ in }
+    var clearClips: () -> Void = {}
+    var clipImage: (ClipItem) -> NSImage? = { _ in nil }
+    var clipBytes: (ClipItem) -> Int = { _ in 0 }
     private(set) var page = 0
     private var trace = Trace()
 
@@ -4354,6 +4611,10 @@ final class BoardView: NSView {
         clips.onCopy = { [weak self] in self?.copyClip($0) }
         clips.onPin = { [weak self] in self?.pinClip($0) }
         clips.onFilter = { [weak self] in self?.relayout() }
+        clips.onDelete = { [weak self] in self?.deleteClip($0) }
+        clips.onClear = { [weak self] in self?.clearClips() }
+        clips.imageFor = { [weak self] in self?.clipImage($0) }
+        clips.bytesFor = { [weak self] in self?.clipBytes($0) ?? 0 }
         for view in [scroll, empty, activityScroll, storageScroll, clipScroll] as [NSView] { well.addSubview(view) }
 
         addSubview(hero)
@@ -4482,7 +4743,7 @@ final class BoardView: NSView {
         switch page {
         case 1: return Metrics.capped(activity.contentHeight, maxHeight: maxHeight)
         case 2: return Metrics.capped(storage.contentHeight, maxHeight: maxHeight)
-        case 3: return Metrics.capped(Metrics.clipHeight(count: clips.shown), maxHeight: maxHeight)
+        case 3: return Metrics.capped(clips.contentHeight, maxHeight: maxHeight)
         default:
             guard !rows.isEmpty else { return Metrics.listHeight(count: 0, maxHeight: maxHeight) }
             return Metrics.capped(serverListHeight, maxHeight: maxHeight)
@@ -4608,7 +4869,7 @@ final class BoardView: NSView {
         if activity.frame.integral != activityFrame.integral { activity.frame = activityFrame }
         let storageFrame = NSRect(x: 0, y: 0, width: width, height: storage.contentHeight)
         if storage.frame.integral != storageFrame.integral { storage.frame = storageFrame }
-        let clipFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.clipHeight(count: clips.shown))
+        let clipFrame = NSRect(x: 0, y: 0, width: width, height: clips.contentHeight)
         if clips.frame.integral != clipFrame.integral { clips.frame = clipFrame }
 
         let w = footer.bounds.width
@@ -4687,6 +4948,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.closePanel()
         }
         board.pinClip = { [weak self] in self?.clips.togglePin($0.id) }
+        board.deleteClip = { [weak self] in self?.clips.remove($0.id) }
+        board.clearClips = { [weak self] in self?.clearClipHistory() }
+        board.clipImage = { [weak self] in self?.clips.image($0) }
+        board.clipBytes = { [weak self] in self?.clips.imageBytes($0) ?? 0 }
         clips.onChange = { [weak self] in
             guard let self else { return }
             self.board.showClips(self.clips.items)
@@ -5003,6 +5268,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         ProcessMonitor.quit(usage, force: answer == .alertSecondButtonReturn)
         activityTicks = 0
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.tickChart() }
+    }
+
+    private func clearClipHistory() {
+        closePanel()
+        let alert = NSAlert()
+        alert.messageText = L("Clear clipboard history?", "Klembordgeschiedenis wissen?")
+        alert.informativeText = L("Removes everything that isn't pinned.", "Verwijdert alles wat niet is vastgezet.")
+        alert.addButton(withTitle: L("Clear", "Wissen"))
+        alert.addButton(withTitle: L("Cancel", "Annuleer"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        clips.clearHistory()
     }
 
     private func revealFolder(_ path: String) {
