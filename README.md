@@ -41,10 +41,11 @@
 ### Your Mac
 
 - 📊 **Summary bar**: number of dev servers, plus CPU, RAM and disk gauges that turn orange and red as they fill up
-- ⚡ **Activity**: large CPU, GPU and memory gauges, a history chart, and the servers using the most CPU
+- ⚡ **Activity**: large CPU, GPU and memory gauges, a history chart, battery (level, health, cycles, charging) and thermal state, and every app and process with its CPU and memory; helpers are counted under their app. Search, sort, and quit or force quit your own apps and processes
 - 💾 **Storage**: used and free space per volume, plus five tools (see below)
 - 📋 **Clipboard history**: search (just start typing) and re-copy recent text, links and files, and pin what you want to keep. Anything a password manager marks as private is skipped, and only pinned clips are saved to disk
 - 🖥️ **Menu bar graph**: the icon is a live mini CPU graph
+- ☕ **Stay awake**: the **Awake** toggle keeps your Mac and display from sleeping, like [KeepingYouAwake](https://github.com/newmarcel/KeepingYouAwake)
 
 ### Storage tools
 
@@ -95,9 +96,11 @@ Click the CPU graph in the menu bar to open the panel. The top bar shows how man
 | | |
 |---|---|
 | 🟢 / 🟠 | Local only / reachable from your network (with a **LAN** button to open it via your IP) |
-| Click a card | Open the server in your browser; hover for Finder, Terminal and Stop |
+| Click a card | Show its details: CPU and memory charts, and every process with its ports and full command line |
+| Hover a card | Open in browser, Finder, Terminal, Stop |
 | **Apps** | Also list regular apps that open ports (Chrome, Spotify, AirPlay…) |
 | **Login** | Start iServer automatically |
+| **Awake** | Keep the Mac and display awake until you turn it off or quit iServer |
 | <kbd>Esc</kbd> | Clear the clipboard search, or close the panel |
 
 It also works from the command line:

@@ -3,6 +3,8 @@ import AppKit
 import CryptoKit
 import Darwin
 import IOKit
+import IOKit.ps
+import IOKit.pwr_mgt
 import ServiceManagement
 
 // MARK: - Localization (English, with Dutch when that is the preferred language)
@@ -1088,6 +1090,139 @@ enum StorageTools {
     }
 }
 
+// MARK: - Stay awake (like KeepingYouAwake): a power assertion that keeps the Mac and display awake
+
+enum Awake {
+    private static var assertion: IOPMAssertionID = 0
+    static var isOn: Bool { assertion != 0 }
+
+    // macOS drops the assertion by itself when iServer quits.
+    @discardableResult
+    static func set(_ on: Bool) -> Bool {
+        if on, assertion == 0 {
+            var id: IOPMAssertionID = 0
+            let result = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                                     IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                     "iServer: Stay awake" as CFString, &id)
+            if result == kIOReturnSuccess { assertion = id }
+        } else if !on, assertion != 0 {
+            IOPMAssertionRelease(assertion)
+            assertion = 0
+        }
+        return isOn
+    }
+}
+
+// MARK: - Apps and processes, battery and thermals (Activity tab)
+
+struct AppUsage {
+    let id: String          // app bundle path, or the executable path of a plain process
+    let name: String
+    let bundlePath: String?
+    var pids: [Int32] = []
+    var cpu = 0.0
+    var rss: UInt64 = 0
+    var owned = true        // every process runs as you, so it can be quit from here
+}
+
+enum ProcessMonitor {
+    // One entry per app (helpers and renderers counted under the app they live in) or per executable.
+    static func sample() -> [AppUsage] {
+        let me = getuid()
+        let own = getpid()
+        var usage: [String: AppUsage] = [:]
+        for line in Scanner.run("/bin/ps", ["-axww", "-o", "pid=,uid=,%cpu=,rss=,comm="]).split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
+            guard parts.count == 5, let pid = Int32(parts[0]), let uid = UInt32(parts[1]) else { continue }
+            let path = String(parts[4])
+            var entry = usage[key(path)] ?? identity(path)
+            entry.pids.append(pid)
+            entry.cpu += Double(parts[2]) ?? 0
+            entry.rss += (UInt64(parts[3]) ?? 0) * 1024
+            if uid != me || pid == own { entry.owned = false }
+            usage[entry.id] = entry
+        }
+        return Array(usage.values)
+    }
+
+    static func key(_ path: String) -> String {
+        guard let range = path.range(of: ".app/") else { return path }
+        return String(path[..<range.lowerBound]) + ".app"
+    }
+
+    static func identity(_ path: String) -> AppUsage {
+        let id = key(path)
+        if id.hasSuffix(".app") {
+            return AppUsage(id: id, name: ((id as NSString).lastPathComponent as NSString).deletingPathExtension, bundlePath: id)
+        }
+        return AppUsage(id: id, name: (path as NSString).lastPathComponent, bundlePath: nil)
+    }
+
+    // Quits gracefully, or force quits. Plain processes only get the signal if they still run the same executable.
+    static func quit(_ usage: AppUsage, force: Bool) {
+        if let bundle = usage.bundlePath,
+           let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL?.path == bundle }) {
+            _ = force ? app.forceTerminate() : app.terminate()
+            if !force { return }
+        }
+        for pid in usage.pids where pid != getpid() {
+            let path = Scanner.execPath(pid)
+            guard !path.isEmpty, ProcessMonitor.key(path) == usage.id else { continue }
+            kill(pid, force ? SIGKILL : SIGTERM)
+        }
+    }
+}
+
+struct PowerInfo {
+    var hasBattery = false
+    var level = 0           // percent
+    var charging = false
+    var pluggedIn = true
+    var minutesLeft: Int?   // to empty, or to full while charging
+    var cycles: Int?
+    var health: Double?     // full-charge capacity against the design capacity
+    var watts: Double?      // into the battery while charging, out of it on battery
+    var thermal = ProcessInfo.ThermalState.nominal
+
+    static func sample() -> PowerInfo {
+        var info = PowerInfo()
+        info.thermal = ProcessInfo.processInfo.thermalState
+        if let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+           let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef] {
+            for source in sources {
+                guard let details = IOPSGetPowerSourceDescription(blob, source)?.takeUnretainedValue() as? [String: Any],
+                      details[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else { continue }
+                info.hasBattery = true
+                let current = (details[kIOPSCurrentCapacityKey] as? NSNumber)?.intValue ?? 0
+                let maximum = (details[kIOPSMaxCapacityKey] as? NSNumber)?.intValue ?? 100
+                info.level = maximum > 0 ? current * 100 / maximum : current
+                info.charging = (details[kIOPSIsChargingKey] as? NSNumber)?.boolValue ?? false
+                info.pluggedIn = details[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue
+                let key = info.charging ? kIOPSTimeToFullChargeKey : kIOPSTimeToEmptyKey
+                if let minutes = (details[key] as? NSNumber)?.intValue, minutes > 0 { info.minutesLeft = minutes }
+            }
+        }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return info }
+        defer { IOObjectRelease(service) }
+        var raw: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &raw, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = raw?.takeRetainedValue() as? [String: Any] else { return info }
+        // Newer macOS versions keep the capacities inside "BatteryData".
+        let data = props["BatteryData"] as? [String: Any] ?? [:]
+        func number(_ key: String) -> Int64? { ((props[key] ?? data[key]) as? NSNumber)?.int64Value }
+        info.cycles = number("CycleCount").map(Int.init)
+        if let design = number("DesignCapacity"), design > 0,
+           let full = number("AppleRawMaxCapacity") ?? number("NominalChargeCapacity") {
+            info.health = min(1, Double(full) / Double(design))
+        }
+        if let volts = number("Voltage"), let amps = number("InstantAmperage") ?? number("Amperage"), amps != 0 {
+            info.watts = Double(volts) * Double(amps) / 1_000_000
+        }
+        return info
+    }
+}
+
 struct ClipItem: Codable, Equatable {
     var id: UUID
     var text: String
@@ -1588,7 +1723,8 @@ enum Metrics {
     static let row: CGFloat = 76
     static let gauges: CGFloat = 128
     static let history: CGFloat = 124
-    static let proc: CGFloat = 32
+    static let proc: CGFloat = 40
+    static let power: CGFloat = 92
     static let volume: CGFloat = 84
     static let cleanHeader: CGFloat = 70
     static let groupRow: CGFloat = 50
@@ -1602,12 +1738,6 @@ enum Metrics {
     static let empty: CGFloat = 150
     static let inset: CGFloat = 12
     static var chrome: CGFloat { header + footer }
-
-    static func activityHeight(count: Int) -> CGFloat {
-        var height = listPad + gauges + history
-        if count > 0 { height += section + CGFloat(count) * proc }
-        return height + listPad * 2
-    }
 
     static func clipHeight(count: Int) -> CGFloat {
         46 + CGFloat(max(count, 1)) * clip + listPad * 2
@@ -1738,6 +1868,17 @@ final class IconButton: HoverView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // Shows a check mark for a moment, e.g. after copying.
+    func flash() {
+        let original = symbolName
+        symbolName = "checkmark"
+        needsDisplay = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            self?.symbolName = original
+            self?.needsDisplay = true
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let active = hovered || pressed
@@ -1894,7 +2035,7 @@ final class ServerCard: HoverView {
     let groupID: Int32
     private let kind: Kind
     private let exposed: Bool
-    private let hasPrimary: Bool
+    var expanded = false { didSet { needsDisplay = true } }
     private let titleLabel: NSTextField
     private let subtitleLabel: NSTextField
     private let cpuLabel: NSTextField
@@ -1908,13 +2049,13 @@ final class ServerCard: HoverView {
          copyText: @escaping (String) -> Void,
          reveal: @escaping (String) -> Void,
          terminal: @escaping (String) -> Void,
+         toggle: @escaping () -> Void,
          stop: @escaping () -> Void) {
         groupID = group.id
         kind = Kind.of(group)
         exposed = group.exposed
         self.history = history
         let primary = group.listeners.first { Scanner.isHTTP($0, in: group) }
-        hasPrimary = primary != nil
 
         titleLabel = makeLabel(group.title, size: 13, weight: .semibold, color: Term.ink)
         subtitleLabel = makeLabel(kind.label + "  ·  " + group.detail, size: 11, weight: .regular, color: Term.dim)
@@ -1928,9 +2069,7 @@ final class ServerCard: HoverView {
         statsLabel.alignment = .right
 
         super.init(frame: .zero)
-        if let primary {
-            onClick = { openURL("http://localhost:\(primary.port)") }
-        }
+        onClick = toggle
         for view in [titleLabel, subtitleLabel, cpuLabel, statsLabel] { addSubview(view) }
 
         for listener in group.listeners {
@@ -1957,6 +2096,11 @@ final class ServerCard: HoverView {
         }
         chips.forEach(addSubview)
 
+        if let primary {
+            buttons.append(IconButton(symbol: "safari", help: L("Open in browser", "Open in browser")) {
+                openURL("http://localhost:\(primary.port)")
+            })
+        }
         if let folder = group.folder {
             buttons.append(IconButton(symbol: "folder", help: L("Show in Finder", "Toon in Finder")) { reveal(folder) })
             buttons.append(IconButton(symbol: "terminal", help: L("Open Terminal here", "Open Terminal hier")) { terminal(folder) })
@@ -1992,10 +2136,6 @@ final class ServerCard: HoverView {
         buttons.forEach { $0.isHidden = !showActions }
         statsLabel.isHidden = showActions
         needsLayout = true
-    }
-
-    override func resetCursorRects() {
-        if hasPrimary { super.resetCursorRects() }
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -2039,7 +2179,13 @@ final class ServerCard: HoverView {
 
     override func draw(_ dirtyRect: NSRect) {
         let card = self.card
-        Draw.card(card, hot: hovered || pressed)
+        Draw.card(card, hot: hovered || pressed || expanded)
+        if expanded {
+            let ring = NSBezierPath(roundedRect: card.insetBy(dx: 0.5, dy: 0.5), xRadius: 14, yRadius: 14)
+            ring.lineWidth = 1.5
+            Term.accent.withAlphaComponent(0.6).setStroke()
+            ring.stroke()
+        }
         let tile = NSRect(x: card.minX + 12, y: card.midY - 18, width: 36, height: 36)
         Draw.monogram(kind, in: tile)
         let dot = NSRect(x: tile.maxX - 8, y: tile.minY - 3, width: 12, height: 12)
@@ -2068,7 +2214,182 @@ final class ServerCard: HoverView {
         lines.append(group.exposed
             ? L("Reachable from your network", "Bereikbaar via het netwerk")
             : L("Local only", "Alleen lokaal bereikbaar"))
+        lines.append(L("Click for details", "Klik voor details"))
         return lines.joined(separator: "\n")
+    }
+}
+
+// Small chart card used in the server details.
+final class MiniChart: NSView {
+    private let title: String
+    private let tint: NSColor
+    private var value = ""
+    private var samples: [Double] = []
+
+    init(title: String, tint: NSColor) {
+        self.title = title
+        self.tint = tint
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Samples are scaled to their own peak so small changes stay visible. With `relative`, the line spans
+    // the lowest to highest sample instead (memory barely moves, so against zero it would be a flat line).
+    func set(value: String, samples raw: [Double], floor: Double, relative: Bool = false) {
+        self.value = value
+        let padded = Array(repeating: raw.first ?? 0, count: max(0, 20 - raw.count)) + raw
+        if relative {
+            let low = padded.min() ?? 0, high = padded.max() ?? 0
+            let span = high - low
+            samples = padded.map { span > high * 0.01 ? 0.15 + 0.7 * ($0 - low) / span : 0.5 }
+        } else {
+            let peak = max(floor, raw.max() ?? 0)
+            samples = padded.map { peak > 0 ? $0 / peak : 0 }
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: 3, dy: 3)
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        Term.fill.setFill()
+        path.fill()
+        Draw.text(title, font: termFont(11, .semibold), color: Term.dim, at: NSPoint(x: card.minX + 10, y: card.maxY - 20))
+        let font = roundedFont(13, .semibold)
+        Draw.text(value, font: font, color: Term.ink, at: NSPoint(x: card.maxX - 10 - Draw.width(value, font: font), y: card.maxY - 21))
+        Draw.spark(samples, in: NSRect(x: card.minX + 10, y: card.minY + 8, width: card.width - 20, height: card.height - 36),
+                   tint: tint, lineWidth: 1.6, fill: true, capacity: 20)
+    }
+}
+
+// One process of a server: name, pid, ports, load, uptime and its full command line.
+final class ProcessDetailRow: NSView {
+    let pid: Int32
+    private let head: NSTextField
+    private let stats: NSTextField
+    private let command: NSTextField
+    private let copy: IconButton
+
+    init(process: ServerProcess, copy copyAction: @escaping (String) -> Void) {
+        pid = process.pid
+        let line = process.args.isEmpty ? process.execPath : process.args
+        head = makeLabel("", size: 12, weight: .semibold, color: Term.ink)
+        stats = makeLabel("", size: 11, weight: .medium, color: Term.dim)
+        stats.font = digitFont(11, .medium)
+        stats.alignment = .right
+        command = makeLabel(line, size: 10.5, weight: .regular, color: Term.dim)
+        command.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        command.lineBreakMode = .byTruncatingMiddle
+        command.cell?.lineBreakMode = .byTruncatingMiddle
+        command.toolTip = line
+        copy = IconButton(symbol: "doc.on.doc", help: L("Copy command", "Kopieer opdracht")) {}
+        super.init(frame: .zero)
+        copy.onClick = { [weak self] in
+            copyAction(line)
+            self?.copy.flash()
+        }
+        for view in [head, stats, command, copy] as [NSView] { addSubview(view) }
+        update(process)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(_ process: ServerProcess) {
+        let ports = process.listeners.map { ":\($0.port)" }.joined(separator: " ")
+        head.stringValue = "\(process.execName)  ·  pid \(process.pid)" + (ports.isEmpty ? "" : "  ·  " + ports)
+        stats.stringValue = "\(Scanner.formatCPU(process.cpu))  ·  \(Scanner.formatBytes(process.rss))  ·  \(Scanner.formatElapsed(process.elapsed))"
+    }
+
+    override func layout() {
+        super.layout()
+        let left = Metrics.inset + 14
+        let right = bounds.width - Metrics.inset - 10
+        copy.frame = NSRect(x: right - 24, y: 3, width: 24, height: 20)
+        stats.frame = NSRect(x: right - 150, y: bounds.height - 21, width: 150, height: 14)
+        head.frame = NSRect(x: left, y: bounds.height - 21, width: max(40, stats.frame.minX - left - 6), height: 15)
+        command.frame = NSRect(x: left, y: 6, width: max(40, copy.frame.minX - left - 6), height: 14)
+    }
+}
+
+// Shown under a server card when it is clicked: CPU and memory over time, and every process.
+final class ServerDetail: NSView {
+    private let cpuChart = MiniChart(title: "CPU", tint: Term.cpu)
+    private let memChart = MiniChart(title: L("Memory", "Geheugen"), tint: Term.mem)
+    private let title = makeLabel("", size: 11, weight: .semibold, color: Term.dim)
+    private let more = makeLabel("", size: 11, weight: .medium, color: Term.dim)
+    private var rows: [ProcessDetailRow] = []
+    private let copy: (String) -> Void
+    private static let maxRows = 8
+    private static let chartHeight: CGFloat = 78
+    private static let rowHeight: CGFloat = 44
+
+    init(copy: @escaping (String) -> Void) {
+        self.copy = copy
+        super.init(frame: .zero)
+        for view in [cpuChart, memChart, title, more] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    var contentHeight: CGFloat {
+        8 + ServerDetail.chartHeight + 24 + CGFloat(rows.count) * ServerDetail.rowHeight + (more.isHidden ? 0 : 20) + 10
+    }
+
+    func show(_ group: ServerGroup, cpu: [Double], mem: [Double]) {
+        cpuChart.set(value: Scanner.formatCPU(group.cpu), samples: cpu, floor: 5)
+        memChart.set(value: Scanner.formatBytes(group.rss), samples: mem, floor: 1, relative: true)
+        let count = group.processes.count
+        title.stringValue = count == 1 ? L("1 process", "1 proces") : L("\(count) processes", "\(count) processen")
+        // Busiest first; rows are reused per pid so they don't flicker.
+        let shown = group.processes.sorted { $0.cpu == $1.cpu ? $0.rss > $1.rss : $0.cpu > $1.cpu }.prefix(ServerDetail.maxRows)
+        var existing = Dictionary(rows.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        rows = shown.map { process in
+            if let row = existing.removeValue(forKey: process.pid) {
+                row.update(process)
+                return row
+            }
+            let row = ProcessDetailRow(process: process, copy: copy)
+            addSubview(row)
+            return row
+        }
+        existing.values.forEach { $0.removeFromSuperview() }
+        let hidden = count - rows.count
+        more.stringValue = L("… and \(hidden) more", "… en nog \(hidden)")
+        more.isHidden = hidden <= 0
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        let inner = bounds.insetBy(dx: Metrics.inset + 6, dy: 0)
+        var y: CGFloat = 8
+        let half = inner.width / 2
+        cpuChart.frame = NSRect(x: inner.minX, y: y, width: half, height: ServerDetail.chartHeight)
+        memChart.frame = NSRect(x: inner.minX + half, y: y, width: half, height: ServerDetail.chartHeight)
+        y += ServerDetail.chartHeight
+        title.frame = NSRect(x: Metrics.inset + 14, y: y + 6, width: 200, height: 14)
+        y += 24
+        for row in rows {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: ServerDetail.rowHeight)
+            y += ServerDetail.rowHeight
+        }
+        more.frame = NSRect(x: Metrics.inset + 14, y: y + 2, width: 200, height: 14)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // A soft panel that hangs under the card it belongs to.
+        let panel = NSRect(x: Metrics.inset + 4, y: 0, width: bounds.width - (Metrics.inset + 4) * 2, height: bounds.height - 4)
+        let path = NSBezierPath(roundedRect: panel, xRadius: 12, yRadius: 12)
+        NSColor.labelColor.withAlphaComponent(0.035).setFill()
+        path.fill()
+        for (index, row) in rows.enumerated() where index > 0 {
+            Term.line.setFill()
+            NSRect(x: Metrics.inset + 14, y: row.frame.minY, width: bounds.width - (Metrics.inset + 14) * 2, height: 1).fill()
+        }
     }
 }
 
@@ -2321,101 +2642,220 @@ final class HistoryCard: NSView {
     }
 }
 
-final class LoadRow: NSView {
-    let groupID: Int32
-    private let kind: Kind
+// Battery level, charging state, health and the Mac's thermal state.
+final class PowerCard: NSView {
+    private var info = PowerInfo()
     private lazy var eased = EasedValues(count: 1, view: self)
-    private var hot = false
+
+    func set(_ info: PowerInfo) {
+        self.info = info
+        eased.set([Double(info.level) / 100])
+        needsDisplay = true
+    }
+
+    private static func duration(_ minutes: Int) -> String {
+        minutes >= 60 ? "\(minutes / 60)\(L("h", "u")) \(minutes % 60)m" : "\(minutes)m"
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        Draw.card(card)
+        let center = NSPoint(x: card.minX + 14 + 28, y: card.midY)
+        if info.hasBattery {
+            let tint: NSColor = info.level <= 20 ? .systemRed : (info.level <= 40 ? .systemOrange : .systemGreen)
+            Draw.ring(center: center, radius: 25, width: 7, fraction: eased[0], tint: tint)
+            Draw.text("\(info.level)%", font: roundedFont(13, .bold), color: Term.ink, centeredAt: center)
+        } else {
+            Draw.tile("powerplug.fill", in: NSRect(x: center.x - 18, y: center.y - 18, width: 36, height: 36), color: .systemGreen)
+        }
+
+        let x = card.minX + 86
+        let state: String
+        let time: String
+        if !info.hasBattery {
+            state = L("Power adapter", "Netstroom")
+            time = L("No battery", "Geen batterij")
+        } else if info.charging {
+            state = L("Charging", "Opladen")
+            time = info.minutesLeft.map { PowerCard.duration($0) + " " + L("to full", "tot vol") } ?? L("Calculating…", "Berekenen…")
+        } else if info.pluggedIn {
+            state = L("Plugged in", "Aan de lader")
+            time = L("Not charging", "Laadt niet")
+        } else {
+            state = L("On battery", "Op batterij")
+            time = info.minutesLeft.map { PowerCard.duration($0) + " " + L("left", "over") } ?? L("Calculating…", "Berekenen…")
+        }
+        if info.charging {
+            drawSymbol("bolt.fill", in: NSRect(x: x, y: card.midY + 10, width: 10, height: 16), pointSize: 10, weight: .bold, color: .systemGreen)
+        }
+        Draw.text(state, font: termFont(13, .semibold), color: Term.ink, at: NSPoint(x: x + (info.charging ? 14 : 0), y: card.midY + 10))
+        Draw.text(time, font: digitFont(11, .regular), color: Term.dim, at: NSPoint(x: x, y: card.midY - 6))
+        var facts: [String] = []
+        if let health = info.health { facts.append(L("Health", "Conditie") + " \(Int((health * 100).rounded()))%") }
+        if let cycles = info.cycles { facts.append("\(cycles) " + L("cycles", "cycli")) }
+        if let watts = info.watts { facts.append(String(format: "%.1f W", abs(watts))) }
+        if !facts.isEmpty {
+            Draw.text(facts.joined(separator: "  ·  "), font: digitFont(11, .regular), color: Term.dim, at: NSPoint(x: x, y: card.midY - 22))
+        }
+
+        // Thermal state pill, top right
+        let (label, color): (String, NSColor) = {
+            switch info.thermal {
+            case .nominal: return (L("Cool", "Koel"), .systemGreen)
+            case .fair: return (L("Warm", "Warm"), .systemYellow)
+            case .serious: return (L("Hot", "Heet"), .systemOrange)
+            case .critical: return (L("Critical", "Kritiek"), .systemRed)
+            @unknown default: return ("–", Term.dim)
+            }
+        }()
+        let font = termFont(10.5, .semibold)
+        let text = L("Thermals", "Warmte") + ": " + label
+        let width = Draw.width(text, font: font) + 24
+        let pill = NSRect(x: card.maxX - 12 - width, y: card.maxY - 12 - 20, width: width, height: 20)
+        color.withAlphaComponent(0.16).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 10, yRadius: 10).fill()
+        drawSymbol("thermometer.medium", in: NSRect(x: pill.minX + 6, y: pill.minY, width: 10, height: pill.height), pointSize: 9, weight: .semibold, color: color)
+        Draw.text(text, font: font, color: color, at: NSPoint(x: pill.minX + 18, y: pill.midY - 7))
+    }
+}
+
+// One app (with its helpers) or one plain process.
+final class ProcessRow: HoverView {
+    private(set) var usage: AppUsage
+    var fraction: Double = 0 { didSet { needsDisplay = true } }
     private let name: NSTextField
+    private let detail: NSTextField
     private let cpu: NSTextField
     private let mem: NSTextField
+    private let quit: IconButton
+    private static var icons: [String: NSImage] = [:]
 
-    init(group: ServerGroup, peak: Double) {
-        groupID = group.id
-        kind = Kind.of(group)
-        name = makeLabel(group.title, size: 12, weight: .medium, color: Term.ink)
+    init(usage: AppUsage, quit quitAction: @escaping (AppUsage) -> Void) {
+        self.usage = usage
+        name = makeLabel(usage.name, size: 12, weight: .medium, color: Term.ink)
+        detail = makeLabel("", size: 10, weight: .regular, color: Term.dim)
         cpu = makeLabel("", size: 12, weight: .semibold, color: Term.ink)
         cpu.font = roundedFont(12, .semibold)
         cpu.alignment = .right
         mem = makeLabel("", size: 11, weight: .medium, color: Term.dim)
         mem.font = digitFont(11, .medium)
         mem.alignment = .right
+        quit = IconButton(symbol: "xmark.circle", help: L("Quit…", "Stop…"), destructive: true) {}
         super.init(frame: .zero)
-        addSubview(name)
-        addSubview(cpu)
-        addSubview(mem)
-        update(group: group, peak: peak)
-    }
-
-    func update(group: ServerGroup, peak: Double) {
-        hot = group.cpu >= 40
-        cpu.stringValue = Scanner.formatCPU(group.cpu)
-        cpu.textColor = hot ? .systemOrange : Term.ink
-        mem.stringValue = Scanner.formatBytes(group.rss)
-        eased.set([peak > 0 ? group.cpu / peak : 0])
+        quit.onClick = { [weak self] in
+            guard let self else { return }
+            quitAction(self.usage)
+        }
+        toolTip = usage.id
+        for view in [name, detail, cpu, mem, quit] as [NSView] { addSubview(view) }
+        quit.isHidden = true
+        update(usage)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    private var barRect: NSRect {
-        NSRect(x: name.frame.maxX + 8, y: bounds.midY - 3, width: max(10, cpu.frame.minX - name.frame.maxX - 16), height: 6)
+    func update(_ usage: AppUsage) {
+        self.usage = usage
+        cpu.stringValue = Scanner.formatCPU(usage.cpu)
+        cpu.textColor = usage.cpu >= 50 ? .systemOrange : (usage.cpu < 0.5 ? Term.dim : Term.ink)
+        mem.stringValue = Scanner.formatBytes(usage.rss)
+        let count = usage.pids.count
+        var text = count == 1 ? "pid \(usage.pids[0])" : "\(count) " + L("processes", "processen")
+        if !usage.owned { text += "  ·  " + L("system", "systeem") }
+        detail.stringValue = text
     }
+
+    override func refresh() {
+        super.refresh()
+        quit.isHidden = !(hovered && usage.owned)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !quit.isHidden, quit.frame.contains(local) { return quit }
+        return self
+    }
+
+    override func resetCursorRects() {}
 
     override func layout() {
         super.layout()
-        let right = bounds.width - Metrics.inset - 10
-        mem.frame = NSRect(x: right - 50, y: (bounds.height - 14) / 2, width: 50, height: 14)
-        cpu.frame = NSRect(x: mem.frame.minX - 54, y: (bounds.height - 16) / 2, width: 50, height: 16)
-        name.frame = NSRect(x: Metrics.inset + 40, y: (bounds.height - 16) / 2, width: 128, height: 16)
+        let right = bounds.width - Metrics.inset - 8
+        mem.frame = NSRect(x: right - 52, y: (bounds.height - 14) / 2, width: 52, height: 14)
+        cpu.frame = NSRect(x: mem.frame.minX - 56, y: (bounds.height - 16) / 2, width: 52, height: 16)
+        quit.frame = NSRect(x: cpu.frame.minX - 30, y: (bounds.height - 22) / 2, width: 24, height: 22)
+        let left = Metrics.inset + 44
+        name.frame = NSRect(x: left, y: bounds.height / 2, width: max(30, quit.frame.minX - left - 6), height: 15)
+        detail.frame = NSRect(x: left, y: bounds.height / 2 - 14, width: max(30, quit.frame.minX - left - 6), height: 13)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        Draw.monogram(kind, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 11, width: 22, height: 22))
-        let bar = barRect
-        Term.fill.setFill()
-        NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
-        var filled = bar
-        filled.size.width = max(bar.height, bar.width * CGFloat(min(1, max(0, eased[0]))))
-        (hot ? NSColor.systemOrange : Term.cpu).setFill()
-        NSBezierPath(roundedRect: filled, xRadius: 3, yRadius: 3).fill()
+        if hovered {
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: Metrics.inset, dy: 1), xRadius: 10, yRadius: 10)
+            Term.fill.setFill()
+            path.fill()
+        }
+        let iconRect = NSRect(x: Metrics.inset + 10, y: bounds.midY - 13, width: 26, height: 26)
+        if let bundle = usage.bundlePath {
+            let icon = ProcessRow.icons[bundle] ?? NSWorkspace.shared.icon(forFile: bundle)
+            ProcessRow.icons[bundle] = icon
+            icon.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
+        } else {
+            Draw.tile(usage.owned ? "terminal.fill" : "gearshape.fill", in: iconRect.insetBy(dx: 1, dy: 1),
+                      color: usage.owned ? .systemIndigo : .systemGray)
+        }
+        // CPU share of the busiest entry
+        let bar = NSRect(x: cpu.frame.minX - 4 - 44, y: bounds.midY - 2, width: 44, height: 4)
+        if fraction > 0.01, bar.minX > name.frame.minX + 60 {
+            Term.fill.setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
+            var filled = bar
+            filled.size.width = max(bar.height, bar.width * CGFloat(min(1, fraction)))
+            (usage.cpu >= 50 ? NSColor.systemOrange : Term.cpu).setFill()
+            NSBezierPath(roundedRect: filled, xRadius: 2, yRadius: 2).fill()
+        }
     }
 }
 
 final class ActivityPane: NSView {
     override var isFlipped: Bool { true }
+    var onQuit: (AppUsage) -> Void = { _ in }
+    var onResize: () -> Void = {}
     private let cpu = Gauge(caption: "CPU", tint: Term.cpu)
     private let gpu = Gauge(caption: "GPU", tint: Term.gpu)
     private let mem = Gauge(caption: L("Memory", "Geheugen"), tint: Term.mem)
     private let history = HistoryCard()
-    private let section = makeLabel(L("Top processes", "Top processen"), size: 11, weight: .semibold, color: Term.dim)
-    private var loads: [LoadRow] = []
+    private let power = PowerCard()
+    private let section = makeLabel(L("Apps & processes", "Apps en processen"), size: 11, weight: .semibold, color: Term.dim)
+    private let filter = CleanFilterRow(placeholder: L("Search apps and processes", "Zoek apps en processen"),
+                                        titles: ["CPU", L("Memory", "Geheugen"), L("Name", "Naam")])
+    private let more = makeLabel("", size: 11, weight: .medium, color: Term.dim)
+    private var all: [AppUsage] = []
+    private var rows: [ProcessRow] = []
+    private var query = ""
+    private var sort = 0  // 0 CPU, 1 memory, 2 name
+    private static let limit = 40
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        for view in [cpu, gpu, mem, history] as [NSView] { addSubview(view) }
-        addSubview(section)
-        section.isHidden = true
+        for view in [cpu, gpu, mem, history, power, section, filter, more] as [NSView] { addSubview(view) }
+        more.alignment = .center
+        more.isHidden = true
+        filter.onChange = { [weak self] query, sort in
+            guard let self else { return }
+            self.query = query
+            self.sort = sort.rawValue
+            self.rebuild()
+            self.onResize()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(vitals: Vitals, trace: Trace, groups: [ServerGroup]) {
-        setCharts(vitals, trace)
-        // Rows are kept per server so their bars glide to new values instead of being rebuilt.
-        let peak = max(1, groups.map(\.cpu).max() ?? 0)
-        var existing = Dictionary(loads.map { ($0.groupID, $0) }, uniquingKeysWith: { first, _ in first })
-        loads = groups.sorted { $0.cpu > $1.cpu }.map { group in
-            if let row = existing.removeValue(forKey: group.id) {
-                row.update(group: group, peak: peak)
-                return row
-            }
-            let row = LoadRow(group: group, peak: peak)
-            addSubview(row)
-            return row
-        }
-        existing.values.forEach { $0.removeFromSuperview() }
-        section.isHidden = loads.isEmpty
-        needsLayout = true
+    var contentHeight: CGFloat {
+        Metrics.listPad + Metrics.gauges + Metrics.history + Metrics.power + Metrics.section + Metrics.filterRow
+            + CGFloat(rows.count) * Metrics.proc + (more.isHidden ? 0 : 30) + Metrics.listPad * 2
     }
 
     func setCharts(_ vitals: Vitals, _ trace: Trace) {
@@ -2428,6 +2868,45 @@ final class ActivityPane: NSView {
         history.set(trace)
     }
 
+    func showPower(_ info: PowerInfo) {
+        power.set(info)
+    }
+
+    func showProcesses(_ list: [AppUsage]) {
+        all = list
+        rebuild()
+        onResize()
+    }
+
+    // Rows are kept per app so they update in place instead of flickering.
+    private func rebuild() {
+        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
+        var shown = needle.isEmpty ? all : all.filter { $0.name.lowercased().contains(needle) || $0.id.lowercased().contains(needle) }
+        switch sort {
+        case 1: shown.sort { $0.rss > $1.rss }
+        case 2: shown.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        default: shown.sort { $0.cpu == $1.cpu ? $0.rss > $1.rss : $0.cpu > $1.cpu }
+        }
+        let hidden = max(0, shown.count - ActivityPane.limit)
+        shown = Array(shown.prefix(ActivityPane.limit))
+        let peak = max(1, shown.map(\.cpu).max() ?? 0)
+        var existing = Dictionary(rows.map { ($0.usage.id, $0) }, uniquingKeysWith: { first, _ in first })
+        rows = shown.map { usage in
+            let row = existing.removeValue(forKey: usage.id) ?? {
+                let row = ProcessRow(usage: usage) { [weak self] in self?.onQuit($0) }
+                addSubview(row)
+                return row
+            }()
+            row.update(usage)
+            row.fraction = usage.cpu / peak
+            return row
+        }
+        existing.values.forEach { $0.removeFromSuperview() }
+        more.stringValue = L("\(hidden) more — search to find them", "nog \(hidden) — zoek om ze te vinden")
+        more.isHidden = hidden == 0
+        needsLayout = true
+    }
+
     override func layout() {
         super.layout()
         var y = Metrics.listPad
@@ -2438,13 +2917,17 @@ final class ActivityPane: NSView {
         y += Metrics.gauges
         history.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.history)
         y += Metrics.history
-        guard !loads.isEmpty else { return }
+        power.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.power)
+        y += Metrics.power
         section.frame = NSRect(x: Metrics.inset + 6, y: y + 10, width: 200, height: 14)
         y += Metrics.section
-        for row in loads {
+        filter.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.filterRow)
+        y += Metrics.filterRow
+        for row in rows {
             row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.proc)
             y += Metrics.proc
         }
+        more.frame = NSRect(x: 16, y: y + 7, width: max(0, bounds.width - 32), height: 16)
     }
 }
 
@@ -2852,7 +3335,8 @@ final class CleanFilterRow: NSView, NSTextFieldDelegate {
     private var chips: [SortChip] = []
     private var sort = Sort.size
 
-    init(placeholder: String) {
+    // The three choices; for storage lists they are size, age and name.
+    init(placeholder: String, titles: [String] = [L("Size", "Grootte"), L("Age", "Leeftijd"), L("Name", "Naam")]) {
         super.init(frame: .zero)
         field.isBezeled = false
         field.drawsBackground = false
@@ -2862,7 +3346,7 @@ final class CleanFilterRow: NSView, NSTextFieldDelegate {
         field.placeholderString = placeholder
         field.delegate = self
         addSubview(field)
-        for (index, title) in [L("Size", "Grootte"), L("Age", "Leeftijd"), L("Name", "Naam")].enumerated() {
+        for (index, title) in titles.enumerated() {
             let chip = SortChip(title)
             chip.on = index == sort.rawValue
             chip.onClick = { [weak self] in self?.choose(Sort(rawValue: index) ?? .size) }
@@ -3784,11 +4268,13 @@ final class BoardView: NSView {
     var stop: (Int32) -> Void = { _ in }
     var setApps: (Bool) -> Void = { _ in }
     var setLogin: (Bool) -> Void = { _ in }
+    var setAwake: (Bool) -> Void = { _ in }
     var quit: () -> Void = {}
     var onPage: () -> Void = {}
     var relayout: () -> Void = {}
     var cleanItems: ([CleanItem], @escaping (Set<String>) -> Void) -> Void = { _, _ in }
     var runningFolders: () -> [String] = { [] }
+    var quitProcess: (AppUsage) -> Void = { _ in }
     var copyClip: (ClipItem) -> Void = { _ in }
     var pinClip: (ClipItem) -> Void = { _ in }
     private(set) var page = 0
@@ -3810,16 +4296,24 @@ final class BoardView: NSView {
     private let hairline = NSView()
     private let appsToggle = TogglePill(L("Apps", "Apps"), symbol: "square.grid.2x2.fill",
                                         help: L("Also show regular apps that listen on a port", "Toon ook gewone apps die op een poort luisteren"))
+    private let awakeToggle = TogglePill(L("Awake", "Wakker"), symbol: "cup.and.saucer.fill",
+                                         help: L("Keep your Mac and display awake", "Houd je Mac en scherm wakker"))
     private let loginToggle = TogglePill(L("Login", "Login"), symbol: "power",
                                          help: L("Launch iServer at login", "Open iServer bij inloggen"))
     private var quitButton: IconButton!
     private var rows: [ServerCard] = []
+    private var expanded: Int32?  // server whose details are open
+    private lazy var detail = ServerDetail { [weak self] in self?.copyText($0) }
+    private var serverGroups: [ServerGroup] = []
+    private var cpuHistory: [Int32: [Double]] = [:]
+    var memHistory: [Int32: [Double]] = [:]
     private var pendingScroll: NSPoint?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         appsToggle.onChange = { [weak self] on in self?.setApps(on) }
         loginToggle.onChange = { [weak self] on in self?.setLogin(on) }
+        awakeToggle.onChange = { [weak self] on in self?.setAwake(on) }
         quitButton = IconButton(symbol: "xmark.circle", help: L("Quit iServer", "Stop iServer")) { [weak self] in self?.quit() }
 
         tabs.onSelect = { [weak self] index in
@@ -3834,6 +4328,7 @@ final class BoardView: NSView {
         footer.addSubview(hairline)
         footer.addSubview(appsToggle)
         footer.addSubview(loginToggle)
+        footer.addSubview(awakeToggle)
         footer.addSubview(quitButton)
 
         configure(scroll)
@@ -3846,6 +4341,11 @@ final class BoardView: NSView {
         clipScroll.documentView = clips
         storage.onClean = { [weak self] items, done in self?.cleanItems(items, done) }
         storage.runningFolders = { [weak self] in self?.runningFolders() ?? [] }
+        activity.onQuit = { [weak self] in self?.quitProcess($0) }
+        activity.onResize = { [weak self] in
+            self?.needsLayout = true
+            self?.relayout()
+        }
         storage.onReveal = { [weak self] in self?.reveal($0) }
         storage.onResize = { [weak self] in
             self?.needsLayout = true
@@ -3919,6 +4419,7 @@ final class BoardView: NSView {
     func setToggles(apps: Bool, login: Bool) {
         appsToggle.checked = apps
         loginToggle.checked = login
+        awakeToggle.checked = Awake.isOn
     }
 
     func setHero(groups: [ServerGroup], vitals: Vitals, disk: DiskVolume?) {
@@ -3932,11 +4433,15 @@ final class BoardView: NSView {
         rows.forEach { $0.removeFromSuperview() }
         rows = groups.map { group in
             ServerCard(group: group, history: history[group.id] ?? [], lan: lan, openURL: openURL, copyText: copyText,
-                       reveal: reveal, terminal: terminal) { [weak self] in
+                       reveal: reveal, terminal: terminal, toggle: { [weak self] in self?.toggleDetails(group.id) }) { [weak self] in
                 self?.stop(group.id)
             }
         }
         rows.forEach(column.addSubview)
+        serverGroups = groups
+        cpuHistory = history
+        if let id = expanded, !groups.contains(where: { $0.id == id }) { expanded = nil }
+        showDetails()
         // Servers that just appeared fade in; the rest stay put.
         if !known.isEmpty {
             for row in rows where !known.contains(row.groupID) {
@@ -3948,7 +4453,7 @@ final class BoardView: NSView {
             }
         }
         setHero(groups: groups, vitals: vitals, disk: volumes.first)
-        if page == 1 { activity.show(vitals: vitals, trace: trace, groups: groups) }
+        if page == 1 { activity.setCharts(vitals, trace) }
         storage.showVolumes(volumes)
         setToggles(apps: includeApps, login: login)
         applyPage()
@@ -3959,24 +4464,58 @@ final class BoardView: NSView {
         setHero(groups: groups, vitals: vitals, disk: volumes.first)
         switch page {
         case 1:
-            activity.show(vitals: vitals, trace: trace, groups: groups)
+            activity.setCharts(vitals, trace)
         case 2:
             storage.showVolumes(volumes)
         default:
             for group in groups {
                 rows.first { $0.groupID == group.id }?.applyStats(group, history: history[group.id] ?? [])
             }
+            serverGroups = groups
+            cpuHistory = history
+            showDetails()
         }
         needsLayout = true
     }
 
     func bodyHeight(maxHeight: CGFloat) -> CGFloat {
         switch page {
-        case 1: return Metrics.capped(Metrics.activityHeight(count: rows.count), maxHeight: maxHeight)
+        case 1: return Metrics.capped(activity.contentHeight, maxHeight: maxHeight)
         case 2: return Metrics.capped(storage.contentHeight, maxHeight: maxHeight)
         case 3: return Metrics.capped(Metrics.clipHeight(count: clips.shown), maxHeight: maxHeight)
-        default: return Metrics.listHeight(count: rows.count, maxHeight: maxHeight)
+        default:
+            guard !rows.isEmpty else { return Metrics.listHeight(count: 0, maxHeight: maxHeight) }
+            return Metrics.capped(serverListHeight, maxHeight: maxHeight)
         }
+    }
+
+    private var serverListHeight: CGFloat {
+        Metrics.listPad * 2 + CGFloat(rows.count) * Metrics.row + (expanded == nil ? 0 : detail.contentHeight)
+    }
+
+    // One server's details at a time; clicking the open one closes it.
+    private func toggleDetails(_ id: Int32) {
+        expanded = expanded == id ? nil : id
+        showDetails()
+        if expanded != nil {
+            detail.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                detail.animator().alphaValue = 1
+            }
+        }
+        needsLayout = true
+        relayout()
+    }
+
+    private func showDetails() {
+        for row in rows { row.expanded = row.groupID == expanded }
+        guard let id = expanded, let group = serverGroups.first(where: { $0.id == id }) else {
+            detail.removeFromSuperview()
+            return
+        }
+        if detail.superview == nil { column.addSubview(detail) }
+        detail.show(group, cpu: cpuHistory[id] ?? [], mem: memHistory[id] ?? [])
     }
 
     func noteCharts(_ vitals: Vitals, _ trace: Trace) {
@@ -3988,6 +4527,11 @@ final class BoardView: NSView {
     func showClips(_ items: [ClipItem]) {
         clips.show(items)
         needsLayout = true
+    }
+
+    func showActivity(processes: [AppUsage], power: PowerInfo) {
+        activity.showProcesses(processes)
+        activity.showPower(power)
     }
 
     func clearClipFilter() -> Bool { clips.clearQuery() }
@@ -4047,6 +4591,10 @@ final class BoardView: NSView {
         for row in rows {
             row.frame = NSRect(x: 0, y: y, width: width, height: Metrics.row)
             y += Metrics.row
+            if row.groupID == expanded {
+                detail.frame = NSRect(x: 0, y: y - 2, width: width, height: detail.contentHeight)
+                y += detail.contentHeight
+            }
         }
         if !rows.isEmpty { y += Metrics.listPad }
         let next = NSRect(x: 0, y: 0, width: width, height: max(y, 1))
@@ -4056,7 +4604,7 @@ final class BoardView: NSView {
             scroll.contentView.scroll(to: point)
         }
 
-        let activityFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.activityHeight(count: rows.count))
+        let activityFrame = NSRect(x: 0, y: 0, width: width, height: activity.contentHeight)
         if activity.frame.integral != activityFrame.integral { activity.frame = activityFrame }
         let storageFrame = NSRect(x: 0, y: 0, width: width, height: storage.contentHeight)
         if storage.frame.integral != storageFrame.integral { storage.frame = storageFrame }
@@ -4069,6 +4617,7 @@ final class BoardView: NSView {
         let pill: CGFloat = 26
         appsToggle.frame = NSRect(x: Metrics.inset, y: (h - pill) / 2, width: appsToggle.preferredWidth, height: pill)
         loginToggle.frame = NSRect(x: appsToggle.frame.maxX + 6, y: (h - pill) / 2, width: loginToggle.preferredWidth, height: pill)
+        awakeToggle.frame = NSRect(x: loginToggle.frame.maxX + 6, y: (h - pill) / 2, width: awakeToggle.preferredWidth, height: pill)
         quitButton.frame = NSRect(x: w - Metrics.inset - 30, y: (h - pill) / 2, width: 30, height: pill)
     }
 }
@@ -4092,6 +4641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var menuCPU: [Double] = []  // system CPU 0...1 for the menu bar graph, newest last
     private var chartTimer: Timer?
     private var charting = false
+    private var activityTicks = 0
     private var timer: Timer?
     private var monitors: [Any] = []
     private var openedAt: TimeInterval = 0
@@ -4114,6 +4664,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         board.stop = { [weak self] in self?.stopGroup($0) }
         board.setApps = { [weak self] in self?.setIncludeApps($0) }
         board.setLogin = { [weak self] in self?.setLogin($0) }
+        board.setAwake = { [weak self] on in
+            guard let self else { return }
+            Awake.set(on)
+            self.board.setToggles(apps: self.includeApps, login: SMAppService.mainApp.status == .enabled)
+        }
         board.quit = { NSApp.terminate(nil) }
         board.relayout = { [weak self] in self?.placePanel(animated: true) }
         board.onPage = { [weak self] in
@@ -4126,6 +4681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         board.cleanItems = { [weak self] items, done in self?.clean(items, done: done) }
         board.runningFolders = { [weak self] in self?.groups.compactMap(\.folder) ?? [] }
+        board.quitProcess = { [weak self] in self?.quitProcess($0) }
         board.copyClip = { [weak self] item in
             self?.clips.copy(item)
             self?.closePanel()
@@ -4221,18 +4777,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             chartTimer = nil
             return
         }
+        activityTicks = 0
         guard chartTimer == nil else { return }
         tickChart()
         chartTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in self?.tickChart() }
         chartTimer?.tolerance = 0.4
     }
 
+    // Charts every tick; the process list and battery every third tick (about every 3.6 s).
     private func tickChart() {
         guard panel.isVisible, board.page == 1, !charting else { return }
         charting = true
+        let withList = activityTicks % 3 == 0
+        activityTicks += 1
         DispatchQueue.global(qos: .utility).async {
             let vitals = Vitals.sample()
+            let processes = withList ? ProcessMonitor.sample() : nil
+            let power = withList ? PowerInfo.sample() : nil
             DispatchQueue.main.async {
+                if let processes, let power, self.panel.isVisible, self.board.page == 1 {
+                    self.board.showActivity(processes: processes, power: power)
+                }
                 self.charting = false
                 guard self.panel.isVisible, self.board.page == 1 else { return }
                 self.vitals = vitals
@@ -4328,10 +4893,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func recordHistory(_ groups: [ServerGroup]) {
         var next: [Int32: [Double]] = [:]
+        var memory: [Int32: [Double]] = [:]
         for group in groups {
             next[group.id] = Array(((cpuHistory[group.id] ?? []) + [group.cpu]).suffix(20))
+            memory[group.id] = Array(((board.memHistory[group.id] ?? []) + [Double(group.rss)]).suffix(20))
         }
         cpuHistory = next
+        board.memHistory = memory
     }
 
     private func updateButton() {
@@ -4416,6 +4984,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 finished(outcome.cleaned)
             }
         }
+    }
+
+    private func quitProcess(_ usage: AppUsage) {
+        closePanel()
+        let alert = NSAlert()
+        alert.messageText = L("Quit \(usage.name)?", "\(usage.name) stoppen?")
+        let count = usage.pids.count
+        alert.informativeText = (count == 1 ? "pid \(usage.pids[0])" : "\(count) " + L("processes", "processen"))
+            + "\n\n" + L("Force Quit stops it right away; unsaved work is lost.",
+                           "Geforceerd stoppen stopt hem meteen; niet-bewaard werk gaat verloren.")
+        alert.addButton(withTitle: L("Quit", "Stop"))
+        alert.addButton(withTitle: L("Force Quit", "Geforceerd stoppen"))
+        alert.addButton(withTitle: L("Cancel", "Annuleer"))
+        NSApp.activate(ignoringOtherApps: true)
+        let answer = alert.runModal()
+        guard answer != .alertThirdButtonReturn else { return }
+        ProcessMonitor.quit(usage, force: answer == .alertSecondButtonReturn)
+        activityTicks = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.tickChart() }
     }
 
     private func revealFolder(_ path: String) {
