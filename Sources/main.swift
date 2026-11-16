@@ -1,5 +1,6 @@
 // iServer — a menu bar app that shows which development servers are running on your Mac.
 import AppKit
+import CryptoKit
 import Darwin
 import IOKit
 import ServiceManagement
@@ -290,6 +291,7 @@ struct Vitals {
     // Sampling happens from several background queues; the tick baseline is shared, so guard it.
     private static let lock = NSLock()
     private static var previousTicks: (UInt32, UInt32, UInt32, UInt32)?
+    private static var lastLoad = 0.0
 
     private static func cpuTicks() -> (UInt32, UInt32, UInt32, UInt32)? {
         var info = host_cpu_load_info()
@@ -311,14 +313,18 @@ struct Vitals {
             previousTicks = cpuTicks()
             usleep(200_000)
         }
-        guard let previous = previousTicks, let now = cpuTicks() else { return 0 }
-        previousTicks = now
+        guard let previous = previousTicks, let now = cpuTicks() else { return lastLoad }
         let user = Double(now.0 &- previous.0)
         let system = Double(now.1 &- previous.1)
         let idle = Double(now.2 &- previous.2)
         let nice = Double(now.3 &- previous.3)
         let total = user + system + idle + nice
-        return total > 0 ? (user + system + nice) / total * 100 : 0
+        // Several callers sample this (menu bar, panel, chart). If the last sample was only moments ago
+        // the window is too short to mean anything, so repeat the last reading.
+        guard total >= 100 else { return lastLoad }
+        previousTicks = now
+        lastLoad = (user + system + nice) / total * 100
+        return lastLoad
     }
 
     static func sample() -> Vitals {
@@ -424,67 +430,661 @@ enum Disks {
     }
 }
 
-struct CleanBin {
-    var id: String
-    var title: String
-    var detail: String
-    var path: String
-    var bytes: UInt64
-    var skip: [String]
+// MARK: - Dev cleanup: find caches and build leftovers, review them, move them to the Trash
+
+enum CleanAction {
+    case trash                      // move every path to the Trash (reversible)
+    case emptyTrash                 // permanently delete what is in ~/.Trash
+    case command(String, [String])  // run a tool, e.g. `docker builder prune` (permanent)
 }
 
-enum Junk {
-    static func scan() -> [CleanBin] {
-        let home = NSHomeDirectory()
-        // No $TMPDIR bin: running apps keep live sockets and in-progress files there.
-        // ~/Library/Caches skips Homebrew (its own bin) and Apple's caches (iCloud, CloudKit, system services).
-        let specs: [(String, String, String, String, [String])] = [
-            ("caches", L("caches", "caches"), "~/Library/Caches", "\(home)/Library/Caches", ["Homebrew", "CloudKit", "com.apple.*"]),
-            ("homebrew", "homebrew", "~/Library/Caches/Homebrew", "\(home)/Library/Caches/Homebrew", []),
-            ("xcode", "xcode", "DerivedData", "\(home)/Library/Developer/Xcode/DerivedData", []),
-            ("logs", L("logs", "logs"), "~/Library/Logs", "\(home)/Library/Logs", []),
-            ("trash", L("trash", "prullenmand"), "~/.Trash", "\(home)/.Trash", []),
+enum NoteStyle { case plain, good, danger }
+
+struct CleanItem {
+    let id: String
+    let title: String
+    let detail: String
+    let paths: [String]
+    var bytes: UInt64
+    let preselect: Bool
+    var note: String?
+    var noteStyle: NoteStyle = .plain
+    var age: Int? = nil  // days since last touched (project leftovers, large files)
+    let action: CleanAction
+    var locked = false   // shown but cannot be selected (a kept duplicate, a running app)
+
+    var permanent: Bool {
+        if case .trash = action { return false }
+        return true
+    }
+}
+
+struct CleanGroup {
+    let id: String
+    let title: String
+    let symbol: String
+    let color: NSColor
+    var items: [CleanItem]
+    var iconPath: String? = nil  // app groups show the app's icon
+    var note: String? = nil
+
+    // What can be removed; locked items don't count.
+    var bytes: UInt64 { items.filter { !$0.locked }.reduce(0) { $0 + $1.bytes } }
+    var totalBytes: UInt64 { items.reduce(0) { $0 + $1.bytes } }
+}
+
+enum DevClean {
+    static let home = NSHomeDirectory()
+    static let fm = FileManager.default
+
+    // `running` are the working folders of servers that are up right now; their projects are never preselected.
+    // Groups are scanned in parallel; `onGroup` gets each one as soon as it is done (on a background queue).
+    static func scan(running: [String], onGroup: @escaping (CleanGroup) -> Void = { _ in }) -> [CleanGroup] {
+        let scanners: [() -> CleanGroup] = [packageCaches, xcode, docker, { projects(running: running) }, system]
+        var results = [CleanGroup?](repeating: nil, count: scanners.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: scanners.count) { index in
+            var group = scanners[index]()
+            group.items = group.items.filter { $0.bytes > 0 }.sorted { $0.bytes > $1.bytes }
+            lock.lock()
+            results[index] = group
+            lock.unlock()
+            onGroup(group)
+        }
+        return results.compactMap { $0 }.filter { !$0.items.isEmpty }
+    }
+
+    static let order = ["packages", "xcode", "docker", "projects", "system"]
+
+    // MARK: Groups
+
+    static func packageCaches() -> CleanGroup {
+        let caches = home + "/Library/Caches"
+        let specs: [(String, String, String)] = [
+            ("npm", "npm", home + "/.npm/_cacache"),
+            ("pnpm", "pnpm store", home + "/Library/pnpm/store"),
+            ("pnpm-home", "pnpm store", home + "/.pnpm-store"),
+            ("yarn", "Yarn", caches + "/Yarn"),
+            ("bun", "Bun", home + "/.bun/install/cache"),
+            ("pip", "pip", caches + "/pip"),
+            ("uv", "uv", home + "/.cache/uv"),
+            ("homebrew", "Homebrew", caches + "/Homebrew"),
+            ("cocoapods", "CocoaPods", caches + "/CocoaPods"),
+            ("gradle", "Gradle", home + "/.gradle/caches"),
+            ("cargo", "Cargo registry", home + "/.cargo/registry/cache"),
+            ("go", L("Go build cache", "Go-buildcache"), caches + "/go-build"),
         ]
-        return specs.map { id, title, detail, path, skip in
-            CleanBin(id: id, title: title, detail: detail, path: path, bytes: bytes(at: path, skipping: skip), skip: skip)
+        let items = sized(specs.compactMap { id, title, path in
+            item("pkg." + id, title, path, note: L("re-downloads", "wordt opnieuw gedownload"))
+        })
+        return CleanGroup(id: "packages", title: L("Package caches", "Pakketcaches"), symbol: "shippingbox.fill",
+                          color: .systemBrown, items: items)
+    }
+
+    static func xcode() -> CleanGroup {
+        let dev = home + "/Library/Developer"
+        let items = sized([
+            item("xc.derived", "DerivedData", dev + "/Xcode/DerivedData", note: L("rebuilds", "wordt opnieuw gebouwd")),
+            item("xc.simcache", L("Simulator caches", "Simulatorcaches"), dev + "/CoreSimulator/Caches"),
+            item("xc.ios", "iOS DeviceSupport", dev + "/Xcode/iOS DeviceSupport", preselect: false,
+                 note: L("re-copied on connect", "opnieuw bij aansluiten")),
+            item("xc.watch", "watchOS DeviceSupport", dev + "/Xcode/watchOS DeviceSupport", preselect: false,
+                 note: L("re-copied on connect", "opnieuw bij aansluiten")),
+            item("xc.archives", "Archives", dev + "/Xcode/Archives", preselect: false,
+                 note: L("your app builds", "je app-builds")),
+        ].compactMap { $0 })
+        return CleanGroup(id: "xcode", title: "Xcode", symbol: "hammer.fill", color: .systemBlue, items: items)
+    }
+
+    static func docker() -> CleanGroup {
+        let group = CleanGroup(id: "docker", title: "Docker", symbol: "cube.box.fill", color: .systemTeal, items: [])
+        let candidates = ["/opt/homebrew/bin/docker", "/usr/local/bin/docker", home + "/.orbstack/bin/docker",
+                          "/Applications/Docker.app/Contents/Resources/bin/docker"]
+        guard let docker = candidates.first(where: fm.isExecutableFile) else { return group }
+        // Only asks the daemon; if Docker isn't running this fails fast and the group stays empty.
+        guard let result = run(docker, ["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"], timeout: 8),
+              result.status == 0 else { return group }
+        // Volumes are left out on purpose: they hold data, not cache.
+        let kinds: [String: (String, String, [String])] = [
+            "Images": ("docker.images", L("Unused images", "Ongebruikte images"), ["image", "prune", "-af"]),
+            "Containers": ("docker.containers", L("Stopped containers", "Gestopte containers"), ["container", "prune", "-f"]),
+            "Build Cache": ("docker.build", L("Build cache", "Buildcache"), ["builder", "prune", "-af"]),
+        ]
+        var items: [CleanItem] = []
+        for line in result.output.split(separator: "\n") {
+            let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let kind = kinds[parts[0]] else { continue }
+            let amount = parts[1].split(separator: " ").first.map(String.init) ?? ""
+            items.append(CleanItem(
+                id: kind.0, title: kind.1, detail: "docker " + kind.2.joined(separator: " "), paths: [],
+                bytes: parseDockerSize(amount), preselect: false,
+                note: L("permanent", "definitief"), noteStyle: .danger, action: .command(docker, kind.2)))
         }
+        var filled = group
+        filled.items = items
+        return filled
     }
 
-    // Top-level entries that are left alone. Patterns ending in "*" match a prefix.
-    static func isSkipped(_ name: String, _ skip: [String]) -> Bool {
-        skip.contains { $0.hasSuffix("*") ? name.hasPrefix(String($0.dropLast())) : name == $0 }
-    }
+    // Folders that tools rebuild, recognised only next to the file that proves what they are.
+    static let artifactRules: [(dir: String, markers: [String], preselect: Bool)] = [
+        ("node_modules", ["package.json"], true),
+        (".next", ["package.json"], true),
+        (".nuxt", ["package.json"], true),
+        (".svelte-kit", ["package.json"], true),
+        (".turbo", ["package.json"], true),
+        (".parcel-cache", ["package.json"], true),
+        ("target", ["Cargo.toml"], true),
+        ("Pods", ["Podfile"], true),
+        (".gradle", ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], true),
+        (".venv", ["pyproject.toml", "requirements.txt", "setup.py"], false),
+        ("venv", ["pyproject.toml", "requirements.txt", "setup.py"], false),
+    ]
 
-    static func empty(_ bin: CleanBin) {
-        let fm = FileManager.default
-        let root = URL(fileURLWithPath: bin.path, isDirectory: true)
-        guard let items = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
-        for item in items where !isSkipped(item.lastPathComponent, bin.skip) {
-            try? fm.removeItem(at: item)
-        }
-    }
+    static let staleDays = 30
 
-    // Counts exactly what empty() removes, hidden files included.
-    private static func bytes(at path: String, skipping skip: [String]) -> UInt64 {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return 0 }
-        let root = URL(fileURLWithPath: path, isDirectory: true)
-        guard let enumerator = fm.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            options: []) else { return 0 }
-        var total: UInt64 = 0
-        for case let url as URL in enumerator {
-            if enumerator.level == 1, isSkipped(url.lastPathComponent, skip) {
-                enumerator.skipDescendants()
-                continue
+    static func projects(running: [String]) -> CleanGroup {
+        let roots = Scanner.projectContainers.map { home + "/" + $0 }.filter { isDirectory($0) }
+        let skip: Set<String> = ["Library", "Applications", ".git", ".Trash"]
+        var stack = roots.map { ($0, 0) }
+        var seen = Set<String>()
+        var visited = 0
+        var items: [CleanItem] = []
+
+        while let (dir, depth) = stack.popLast(), visited < 30_000 {
+            visited += 1
+            guard seen.insert(dir).inserted, let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            let present = Set(names)
+            let found = artifactRules.filter { present.contains($0.dir) && $0.markers.contains(where: present.contains) }
+            if !found.isEmpty {
+                let artifacts = Set(found.map(\.dir))
+                let days = daysSinceTouched(dir, ignoring: artifacts)
+                let active = running.contains { $0 == dir || $0.hasPrefix(dir + "/") }
+                let name = (dir as NSString).lastPathComponent
+                for rule in found {
+                    let path = dir + "/" + rule.dir
+                    guard isDirectory(path) else { continue }
+                    var item = CleanItem(
+                        id: "proj." + path, title: "\(name) · \(rule.dir)", detail: tilde(dir), paths: [path], bytes: 0,
+                        preselect: rule.preselect && !active && days >= staleDays,
+                        note: active ? L("running", "draait") : "\(days)d", action: .trash)
+                    item.age = days
+                    if active { item.noteStyle = .good }
+                    items.append(item)
+                }
             }
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  values.isRegularFile == true else { continue }
-            total += UInt64(values.fileSize ?? 0)
+            guard depth < 6 else { continue }
+            for child in names where !child.hasPrefix(".") && !skip.contains(child) {
+                if found.contains(where: { $0.dir == child }) { continue }
+                let path = dir + "/" + child
+                if isDirectory(path) { stack.append((path, depth + 1)) }
+            }
+        }
+        return CleanGroup(id: "projects", title: L("Project leftovers", "Projectresten"), symbol: "folder.fill.badge.gearshape",
+                          color: .systemIndigo, items: sized(items))
+    }
+
+    static func system() -> CleanGroup {
+        let caches = home + "/Library/Caches"
+        // Package-manager caches have their own rows; Apple's and iCloud caches are left alone.
+        let claimed: Set<String> = ["Homebrew", "Yarn", "pip", "CocoaPods", "go-build", "CloudKit"]
+        let appCaches = children(of: caches).filter {
+            let name = ($0 as NSString).lastPathComponent
+            return !name.hasPrefix("com.apple.") && !claimed.contains(name)
+        }
+        var items: [CleanItem] = [
+            CleanItem(id: "sys.caches", title: L("App caches", "App-caches"), detail: "~/Library/Caches", paths: appCaches,
+                      bytes: 0, preselect: true, note: L("apps rebuild these", "apps maken ze opnieuw"), action: .trash),
+            CleanItem(id: "sys.logs", title: L("Logs", "Logs"), detail: "~/Library/Logs", paths: children(of: home + "/Library/Logs"),
+                      bytes: 0, preselect: true, action: .trash),
+        ]
+        let trash = home + "/.Trash"
+        if (try? fm.contentsOfDirectory(atPath: trash)) != nil {
+            items.append(CleanItem(id: "sys.trash", title: L("Trash", "Prullenmand"), detail: "~/.Trash", paths: [trash],
+                                   bytes: 0, preselect: false, note: L("permanent", "definitief"), noteStyle: .danger,
+                                   action: .emptyTrash))
+        }
+        return CleanGroup(id: "system", title: L("System", "Systeem"), symbol: "gearshape.fill", color: .systemGray,
+                          items: sized(items))
+    }
+
+    // MARK: Cleaning
+
+    struct Outcome {
+        var trashed: UInt64 = 0
+        var deleted: UInt64 = 0
+        var failed: [String] = []
+        var cleaned: Set<String> = []  // ids of items that are gone now
+    }
+
+    static func clean(_ items: [CleanItem]) -> Outcome {
+        var outcome = Outcome()
+        for item in items {
+            switch item.action {
+            case .trash:
+                var moved = true
+                for path in item.paths where fm.fileExists(atPath: path) {
+                    do {
+                        try fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
+                    } catch {
+                        moved = false
+                    }
+                }
+                if moved {
+                    outcome.trashed += item.bytes
+                    outcome.cleaned.insert(item.id)
+                } else {
+                    outcome.failed.append(item.title)
+                }
+            case .emptyTrash:
+                var emptied = true
+                for path in children(of: home + "/.Trash") {
+                    do { try fm.removeItem(atPath: path) } catch { emptied = false }
+                }
+                if emptied {
+                    outcome.deleted += item.bytes
+                    outcome.cleaned.insert(item.id)
+                } else {
+                    outcome.failed.append(item.title)
+                }
+            case let .command(tool, args):
+                if let result = run(tool, args, timeout: 300), result.status == 0 {
+                    outcome.deleted += item.bytes
+                    outcome.cleaned.insert(item.id)
+                } else {
+                    outcome.failed.append(item.title)
+                }
+            }
+        }
+        return outcome
+    }
+
+    // MARK: Helpers
+
+    static func tilde(_ path: String) -> String {
+        path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+
+    static func isDirectory(_ path: String) -> Bool {
+        let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        return values?.isDirectory == true && values?.isSymbolicLink != true
+    }
+
+    static func children(of dir: String) -> [String] {
+        ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0 != ".DS_Store" }.map { dir + "/" + $0 }
+    }
+
+    static func item(_ id: String, _ title: String, _ path: String, preselect: Bool = true, note: String? = nil) -> CleanItem? {
+        guard fm.fileExists(atPath: path) else { return nil }
+        return CleanItem(id: id, title: title, detail: tilde(path), paths: [path], bytes: 0, preselect: preselect,
+                         note: note, action: .trash)
+    }
+
+    // Fills in sizes, several items at a time.
+    static func sized(_ items: [CleanItem]) -> [CleanItem] {
+        var out = items
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: items.count) { index in
+            let bytes = items[index].paths.reduce(UInt64(0)) { $0 + allocatedSize($1) }
+            lock.lock()
+            if out[index].bytes == 0 { out[index].bytes = bytes }
+            lock.unlock()
+        }
+        return out
+    }
+
+    // Space on disk, like Finder's "on disk" figure. Symbolic links are not followed.
+    static func allocatedSize(_ path: String, cancelled: () -> Bool = { false }) -> UInt64 {
+        let url = URL(fileURLWithPath: path)
+        let keys: [URLResourceKey] = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+        func size(_ url: URL) -> UInt64 {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else { return 0 }
+            return UInt64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        }
+        guard isDirectory(path) else { return size(url) }
+        guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: keys, options: [],
+                                             errorHandler: { _, _ in true }) else { return 0 }
+        var total: UInt64 = 0
+        var count = 0
+        for case let child as URL in enumerator {
+            total += size(child)
+            count += 1
+            if count % 2000 == 0, cancelled() { return total }
         }
         return total
+    }
+
+    // Days since anything outside the build folders changed, looking two levels deep.
+    static func daysSinceTouched(_ dir: String, ignoring artifacts: Set<String>) -> Int {
+        var latest = Date.distantPast
+        var checked = 0
+        func visit(_ path: String, depth: Int) {
+            guard let names = try? fm.contentsOfDirectory(atPath: path) else { return }
+            for name in names where !artifacts.contains(name) && name != ".git" && name != ".DS_Store" {
+                checked += 1
+                if checked > 600 { return }
+                let child = path + "/" + name
+                let url = URL(fileURLWithPath: child)
+                if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date > latest {
+                    latest = date
+                }
+                if depth < 2, !name.hasPrefix("."), isDirectory(child) { visit(child, depth: depth + 1) }
+            }
+        }
+        visit(dir, depth: 0)
+        guard latest != .distantPast else { return 0 }
+        return max(0, Int(Date().timeIntervalSince(latest) / 86_400))
+    }
+
+    // "1.25GB" → bytes. Docker uses decimal units.
+    static func parseDockerSize(_ text: String) -> UInt64 {
+        let units: [(String, Double)] = [("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("KB", 1e3), ("B", 1)]
+        for (unit, factor) in units where text.hasSuffix(unit) {
+            return UInt64((Double(text.dropLast(unit.count)) ?? 0) * factor)
+        }
+        return 0
+    }
+
+    // Runs a tool and gives up after `timeout` seconds.
+    static func run(_ path: String, _ args: [String], timeout: TimeInterval) -> (status: Int32, output: String)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        do { try process.run() } catch { return nil }
+        var output = Data()
+        let reader = DispatchQueue.global(qos: .utility)
+        let readDone = DispatchSemaphore(value: 0)
+        reader.async {
+            output = pipe.fileHandleForReading.readDataToEndOfFile()
+            readDone.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = done.wait(timeout: .now() + 2)
+            return nil
+        }
+        _ = readDone.wait(timeout: .now() + 2)
+        return (process.terminationStatus, String(decoding: output, as: UTF8.self))
+    }
+}
+
+// MARK: - Storage tools: large & old files, duplicates, apps and their leftovers
+
+enum StorageTools {
+    static let home = NSHomeDirectory()
+    static let fm = FileManager.default
+    static let skipFolders: Set<String> = ["node_modules", ".git", "Library", ".Trash"]
+
+    static var userFolders: [String] {
+        ["Downloads", "Desktop", "Documents", "Movies", "Music", "Pictures"].map { home + "/" + $0 }.filter(DevClean.isDirectory)
+    }
+
+    struct FileInfo {
+        let path: String
+        let size: UInt64
+        let modified: Date
+        let created: Date
+    }
+
+    // Walks the user folders. Packages (apps, the Photos library) count as one item and are not entered;
+    // symbolic links, build folders and files that only live in iCloud (no local data) are skipped.
+    static func walk(minSize: UInt64, _ body: (FileInfo) -> Void) {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey,
+                                      .contentModificationDateKey, .creationDateKey]
+        for root in userFolders {
+            guard let enumerator = fm.enumerator(at: URL(fileURLWithPath: root), includingPropertiesForKeys: keys,
+                                                 options: [.skipsPackageDescendants], errorHandler: { _, _ in true }) else { continue }
+            for case let url as URL in enumerator {
+                if skipFolders.contains(url.lastPathComponent) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                guard let values = try? url.resourceValues(forKeys: Set(keys)),
+                      values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                let size = UInt64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+                guard size >= minSize else { continue }
+                // An iCloud file that isn't fully on this Mac would be downloaded (or block) when read.
+                // Asked only for files that pass the size check, because the iCloud lookup is slow.
+                if let cloud = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
+                   cloud.isUbiquitousItem == true, cloud.ubiquitousItemDownloadingStatus != .current { continue }
+                body(FileInfo(path: url.path, size: size, modified: values.contentModificationDate ?? .distantPast,
+                              created: values.creationDate ?? .distantPast))
+            }
+        }
+    }
+
+    static func ageText(_ days: Int) -> String {
+        days >= 730 ? "\(days / 365)" + L("y", "j") : "\(days)d"
+    }
+
+    // MARK: Large & old files
+
+    static func largeFiles() -> [CleanGroup] {
+        let now = Date()
+        var items: [CleanItem] = []
+        walk(minSize: 10_000_000) { file in
+            let days = max(0, Int(now.timeIntervalSince(file.modified) / 86_400))
+            guard file.size >= 100_000_000 || days >= 365, items.count < 3000 else { return }
+            var item = CleanItem(
+                id: "large." + file.path, title: (file.path as NSString).lastPathComponent,
+                detail: DevClean.tilde((file.path as NSString).deletingLastPathComponent), paths: [file.path],
+                bytes: file.size, preselect: false, note: ageText(days), action: .trash)
+            item.age = days
+            items.append(item)
+        }
+        guard !items.isEmpty else { return [] }
+        return [CleanGroup(id: "large", title: L("Large & old files", "Grote en oude bestanden"), symbol: "doc.fill",
+                           color: .systemOrange, items: items.sorted { $0.bytes > $1.bytes })]
+    }
+
+    // MARK: Duplicates
+
+    // Same size, then the same samples (start, middle, end), then the same SHA-256 of the whole file.
+    // Hard links are one file. In every set the oldest copy is kept and cannot be selected.
+    // Sets are reported through `onGroup` as soon as they are found; size buckets are checked in parallel.
+    static func duplicates(onGroup: @escaping (CleanGroup) -> Void = { _ in }) -> [CleanGroup] {
+        var bySize: [UInt64: [FileInfo]] = [:]
+        walk(minSize: 1_000_000) { bySize[$0.size, default: []].append($0) }
+        let buckets: [[FileInfo]] = bySize.values.compactMap { files in
+            guard files.count > 1 else { return nil }
+            var inodes = Set<UInt64>()
+            let unique = files.filter { inodes.insert(inode($0.path)).inserted }
+            return unique.count > 1 ? unique : nil
+        }
+        var groups: [CleanGroup] = []
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: buckets.count) { index in
+            lock.lock()
+            let full = groups.count >= 300
+            lock.unlock()
+            guard !full else { return }
+            for (sample, sameSample) in Dictionary(grouping: buckets[index], by: { samples($0.path, size: $0.size) ?? "" })
+            where !sample.isEmpty && sameSample.count > 1 {
+                for (digest, same) in Dictionary(grouping: sameSample, by: { hash($0.path, limit: nil) ?? "" })
+                where !digest.isEmpty && same.count > 1 {
+                    let group = duplicateGroup(digest, same)
+                    lock.lock()
+                    groups.append(group)
+                    lock.unlock()
+                    onGroup(group)
+                }
+            }
+        }
+        return groups.sorted { $0.bytes > $1.bytes }
+    }
+
+    static func duplicateGroup(_ digest: String, _ files: [FileInfo]) -> CleanGroup {
+        let sorted = files.sorted { $0.created < $1.created }
+        let items = sorted.enumerated().map { index, file -> CleanItem in
+            var item = CleanItem(
+                id: "dup." + file.path, title: (file.path as NSString).lastPathComponent,
+                detail: DevClean.tilde((file.path as NSString).deletingLastPathComponent), paths: [file.path],
+                bytes: file.size, preselect: false, note: index == 0 ? L("kept", "blijft") : L("copy", "kopie"),
+                action: .trash)
+            if index == 0 {
+                item.locked = true
+                item.noteStyle = .good
+            }
+            return item
+        }
+        return CleanGroup(id: "dup." + digest, title: items[0].title, symbol: "doc.on.doc.fill", color: .systemPink, items: items)
+    }
+
+    // Hash of 64 KB at the start, middle and end: cheap, and rules out most same-size files.
+    static func samples(_ path: String, size: UInt64) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        let chunk = 65_536
+        for offset in [0, size / 2, size > UInt64(chunk) ? size - UInt64(chunk) : 0] {
+            guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.read(upToCount: chunk) else { return nil }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func inode(_ path: String) -> UInt64 {
+        var info = stat()
+        return lstat(path, &info) == 0 ? UInt64(info.st_ino) : UInt64.random(in: 1...UInt64.max)
+    }
+
+    static func hash(_ path: String, limit: Int?) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var remaining = limit ?? Int.max
+        while remaining > 0 {
+            guard let chunk = try? handle.read(upToCount: min(1 << 20, remaining)), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            remaining -= chunk.count
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: Apps and leftovers
+
+    // One group per app: the app itself plus the files it keeps in ~/Library. Apple's apps are left out.
+    // Apps that are running are shown but locked. A last group lists files of apps that are gone.
+    static func apps(running: Set<String>) -> [CleanGroup] {
+        var groups: [CleanGroup] = []
+        var installed = Set<String>()
+        for appPath in appBundles() {
+            guard let bundle = Bundle(path: appPath), let id = bundle.bundleIdentifier else { continue }
+            installed.insert(id)
+            guard !id.hasPrefix("com.apple.") else { continue }
+            let display = ((appPath as NSString).lastPathComponent as NSString).deletingPathExtension
+            let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? display
+            var items = [CleanItem(id: "app." + appPath, title: display, detail: DevClean.tilde(appPath), paths: [appPath],
+                                   bytes: 0, preselect: false, note: L("app", "app"), action: .trash)]
+            for path in leftovers(id: id, names: [name, display]) {
+                let relative = path.hasPrefix(home + "/Library/") ? String(path.dropFirst(home.count + 9)) : DevClean.tilde(path)
+                items.append(CleanItem(id: "app." + path, title: relative, detail: DevClean.tilde((path as NSString).deletingLastPathComponent),
+                                       paths: [path], bytes: 0, preselect: false, action: .trash))
+            }
+            let isRunning = running.contains(id)
+            if isRunning {
+                items = items.map {
+                    var item = $0
+                    item.locked = true
+                    return item
+                }
+            }
+            var group = CleanGroup(id: "app." + id, title: display, symbol: "app.fill", color: .systemGray, items: DevClean.sized(items))
+            group.iconPath = appPath
+            group.note = isRunning ? L("running, quit it first", "draait, sluit hem eerst af") : nil
+            groups.append(group)
+        }
+        groups.sort { $0.totalBytes > $1.totalBytes }
+        installed.formUnion(otherInstalledIDs())
+        if let orphans = orphans(installed: installed) { groups.append(orphans) }
+        return groups
+    }
+
+    static func appBundles() -> [String] {
+        var out: [String] = []
+        for dir in ["/Applications", home + "/Applications"] {
+            for path in DevClean.children(of: dir) {
+                if path.hasSuffix(".app") {
+                    out.append(path)
+                } else if DevClean.isDirectory(path) {
+                    out += DevClean.children(of: path).filter { $0.hasSuffix(".app") }
+                }
+            }
+        }
+        return out
+    }
+
+    // Apps anywhere on disk (Spotlight), so leftovers of apps that live elsewhere aren't called orphans.
+    static func otherInstalledIDs() -> Set<String> {
+        var ids = Set<String>()
+        for dir in ["/System/Applications", "/System/Applications/Utilities"] {
+            for path in DevClean.children(of: dir) where path.hasSuffix(".app") {
+                if let id = Bundle(path: path)?.bundleIdentifier { ids.insert(id) }
+            }
+        }
+        if let result = DevClean.run("/usr/bin/mdfind", ["kMDItemContentType == 'com.apple.application-bundle'"], timeout: 15) {
+            for line in result.output.split(separator: "\n") {
+                if let id = Bundle(path: String(line))?.bundleIdentifier { ids.insert(id) }
+            }
+        }
+        return ids
+    }
+
+    static func leftovers(id: String, names: [String]) -> [String] {
+        let lib = home + "/Library/"
+        var candidates = [
+            "Application Support/\(id)", "Caches/\(id)", "Containers/\(id)", "Preferences/\(id).plist",
+            "Saved Application State/\(id).savedState", "HTTPStorages/\(id)", "HTTPStorages/\(id).binarycookies",
+            "WebKit/\(id)", "Cookies/\(id).binarycookies", "Application Scripts/\(id)", "Logs/\(id)", "LaunchAgents/\(id).plist",
+        ]
+        for name in Set(names) where name.count >= 3 {
+            candidates += ["Application Support/\(name)", "Caches/\(name)", "Logs/\(name)"]
+        }
+        var found = candidates.map { lib + $0 }.filter { fm.fileExists(atPath: $0) }
+        for dir in ["Group Containers", "LaunchAgents"] {
+            found += DevClean.children(of: lib + dir).filter {
+                let name = ($0 as NSString).lastPathComponent
+                return name.hasSuffix("." + id) || name.hasPrefix(id + ".")
+            }
+        }
+        var seen = Set<String>()
+        return found.filter { seen.insert($0).inserted }
+    }
+
+    // Folders named like a bundle id ("com.vendor.app") whose vendor has no app installed at all.
+    // Matching by vendor is deliberately cautious; everything here still needs a human look.
+    static func orphans(installed: Set<String>) -> CleanGroup? {
+        let vendors = Set(installed.map(vendor))
+        let lib = home + "/Library/"
+        var items: [CleanItem] = []
+        for dir in ["Application Support", "Caches", "Containers", "Saved Application State", "HTTPStorages", "WebKit",
+                    "Preferences", "Logs"] {
+            for path in DevClean.children(of: lib + dir) {
+                var id = (path as NSString).lastPathComponent
+                for suffix in [".plist", ".savedState", ".binarycookies"] where id.hasSuffix(suffix) { id.removeLast(suffix.count) }
+                guard looksLikeBundleID(id), !id.lowercased().hasPrefix("com.apple."), !vendors.contains(vendor(id)) else { continue }
+                items.append(CleanItem(id: "orphan." + path, title: id, detail: "~/Library/" + dir, paths: [path], bytes: 0,
+                                       preselect: false, note: L("check", "controleer"), action: .trash))
+            }
+        }
+        let sized = DevClean.sized(items).filter { $0.bytes > 0 }.sorted { $0.bytes > $1.bytes }
+        guard !sized.isEmpty else { return nil }
+        return CleanGroup(id: "orphans", title: L("Leftovers of removed apps", "Resten van verwijderde apps"),
+                          symbol: "questionmark.folder.fill", color: .systemBrown, items: sized)
+    }
+
+    static func vendor(_ id: String) -> String {
+        id.lowercased().split(separator: ".").prefix(2).joined(separator: ".")
+    }
+
+    static func looksLikeBundleID(_ text: String) -> Bool {
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 3, (2...6).contains(parts[0].count), parts[0].allSatisfy(\.isLetter) else { return false }
+        return parts.allSatisfy { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" } }
     }
 }
 
@@ -649,7 +1249,6 @@ enum Term {
     static var mem: NSColor { .systemPurple }
     static var disk: NSColor { .systemGreen }
     static var lan: NSColor { .systemOrange }
-    static var bins: [NSColor] { [.systemBlue, .systemBrown, .systemTeal, .systemPurple, .systemPink, .systemGreen] }
 }
 
 func termFont(_ size: CGFloat, _ weight: NSFont.Weight = .medium) -> NSFont {
@@ -863,7 +1462,7 @@ enum Draw {
         }
     }
 
-    // Small tinted tile with a symbol (storage bins, clipboard kinds).
+    // Small tinted tile with a symbol (cleanup groups, clipboard kinds).
     static func tile(_ symbol: String, in rect: NSRect, color: NSColor) {
         let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
         color.withAlphaComponent(0.16).setFill()
@@ -991,7 +1590,12 @@ enum Metrics {
     static let history: CGFloat = 124
     static let proc: CGFloat = 32
     static let volume: CGFloat = 84
-    static let bin: CGFloat = 46
+    static let cleanHeader: CGFloat = 70
+    static let groupRow: CGFloat = 50
+    static let itemRow: CGFloat = 40
+    static let filterRow: CGFloat = 42
+    static let modeBar: CGFloat = 40
+    static let explorerRow: CGFloat = 42
     static let clip: CGFloat = 50
     static let section: CGFloat = 28
     static let listPad: CGFloat = 4
@@ -1003,10 +1607,6 @@ enum Metrics {
         var height = listPad + gauges + history
         if count > 0 { height += section + CGFloat(count) * proc }
         return height + listPad * 2
-    }
-
-    static func storageHeight(volumes: Int, bins: Int) -> CGFloat {
-        listPad + CGFloat(max(volumes, 1)) * volume + section + 22 + CGFloat(max(bins, 1)) * bin + listPad * 2
     }
 
     static func clipHeight(count: Int) -> CGFloat {
@@ -1890,71 +2490,159 @@ final class VolumeCard: NSView {
     }
 }
 
-final class BinRow: NSView {
-    private let symbol: String
-    private let color: NSColor
-    private let title: NSTextField
-    private let detail: NSTextField
-    private let size: NSTextField
-    private let clear: QuietButton
-
-    static func symbol(for id: String) -> String {
-        switch id {
-        case "caches": return "archivebox.fill"
-        case "homebrew": return "mug.fill"
-        case "xcode": return "hammer.fill"
-        case "logs": return "doc.text.fill"
-        case "trash": return "trash.fill"
-        default: return "folder.fill"
-        }
+// Round check mark: 0 = off, 1 = some (group), 2 = on.
+func drawCheck(_ state: Int, in rect: NSRect) {
+    guard state > 0 else {
+        drawSymbol("circle", in: rect, pointSize: 15, weight: .regular, color: Term.faint)
+        return
     }
+    // Two-tone: white mark on an accent disc.
+    let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [.white, Term.accent]))
+    guard let image = NSImage(systemSymbolName: state == 2 ? "checkmark.circle.fill" : "minus.circle.fill",
+                              accessibilityDescription: nil)?.withSymbolConfiguration(config) else { return }
+    let size = image.size
+    image.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height),
+               from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+}
 
-    init(bin: CleanBin, color: NSColor, clear clearAction: @escaping () -> Void) {
-        symbol = BinRow.symbol(for: bin.id)
-        self.color = color
-        title = makeLabel(bin.title.prefix(1).uppercased() + bin.title.dropFirst(), size: 12, weight: .semibold, color: Term.ink)
-        detail = makeLabel(bin.detail, size: 10, weight: .regular, color: Term.dim)
-        size = makeLabel(bin.bytes == 0 ? "0" : Scanner.formatBytes(bin.bytes), size: 12, weight: .semibold,
-                         color: bin.bytes == 0 ? Term.dim : Term.ink)
-        size.font = roundedFont(12, .semibold)
-        size.alignment = .right
-        clear = QuietButton(L("Clear", "Leeg")) { clearAction() }
+// Filled pill button for the main action.
+final class AccentButton: HoverView {
+    var title = "" { didSet { needsDisplay = true } }
+    var enabled = true { didSet { needsDisplay = true } }
+    private static let font = termFont(12, .semibold)
+
+    var preferredWidth: CGFloat { Draw.width(title, font: AccentButton.font) + 28 }
+
+    init(action: @escaping () -> Void) {
         super.init(frame: .zero)
-        clear.isHidden = bin.bytes == 0
-        for view in [title, detail, size, clear] as [NSView] { addSubview(view) }
+        onClick = { [weak self] in
+            if self?.enabled == true { action() }
+        }
+        setAccessibilityRole(.button)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    override func layout() {
-        super.layout()
-        let right = bounds.width - Metrics.inset - 8
-        clear.frame = NSRect(x: right - 54, y: (bounds.height - 24) / 2, width: 54, height: 24)
-        size.frame = NSRect(x: clear.frame.minX - 70, y: (bounds.height - 16) / 2, width: 62, height: 16)
-        let left = Metrics.inset + 48
-        title.frame = NSRect(x: left, y: bounds.height / 2 + 1, width: max(40, size.frame.minX - left - 8), height: 15)
-        detail.frame = NSRect(x: left, y: bounds.height / 2 - 14, width: title.frame.width, height: 13)
+    override func resetCursorRects() {
+        if enabled { super.resetCursorRects() }
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        Draw.tile(symbol, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 15, width: 30, height: 30), color: color)
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        if enabled {
+            (hovered ? Term.accent.blended(withFraction: 0.15, of: .white) ?? Term.accent : Term.accent).setFill()
+        } else {
+            Term.fill.setFill()
+        }
+        path.fill()
+        Draw.text(title, font: AccentButton.font, color: enabled ? .white : Term.dim, centeredAt: NSPoint(x: bounds.midX, y: bounds.midY))
+        setAccessibilityLabel(title)
+    }
+}
+
+// Summary card above the cleanup list: what was found, what is selected, and the Clean button.
+final class CleanHeader: NSView {
+    var onClean: () -> Void = {}
+    var onRescan: () -> Void = {}
+    private var scanned = false
+    // Before the first scan the main button scans; after that it cleans.
+    private lazy var clean = AccentButton { [weak self] in
+        guard let self else { return }
+        if self.scanned { self.onClean() } else { self.onRescan() }
+    }
+    private lazy var rescan = IconButton(symbol: "arrow.clockwise", help: L("Scan again", "Opnieuw scannen")) { [weak self] in self?.onRescan() }
+    private let spinner = NSProgressIndicator()
+    private var subtitle = ""
+    private let title: String
+    private let symbol: String
+    private let idle: String
+
+    init(title: String, symbol: String, idle: String) {
+        self.title = title
+        self.symbol = symbol
+        self.idle = idle
+        super.init(frame: .zero)
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        addSubview(clean)
+        addSubview(rescan)
+        addSubview(spinner)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func set(found: UInt64, selected: UInt64, count: Int, scanning: Bool, scanned: Bool) {
+        self.scanned = scanned
+        if !scanned && !scanning {
+            subtitle = idle
+            rescan.isHidden = true
+            clean.title = L("Scan", "Scannen")
+            clean.enabled = true
+            needsLayout = true
+            needsDisplay = true
+            return
+        }
+        if scanning {
+            subtitle = L("Scanning…", "Scannen…") + (found > 0 ? "  \(Scanner.formatBytes(found)) " + L("so far", "tot nu toe") : "")
+            spinner.startAnimation(nil)
+        } else {
+            subtitle = found == 0
+                ? L("Nothing found yet", "Nog niets gevonden")
+                : "\(Scanner.formatBytes(found)) " + L("found", "gevonden") + "  ·  \(count) " + L("selected", "geselecteerd")
+            spinner.stopAnimation(nil)
+        }
+        rescan.isHidden = scanning
+        clean.title = selected > 0 ? L("Clean", "Opschonen") + " " + Scanner.formatBytes(selected) : L("Clean", "Opschonen")
+        clean.enabled = selected > 0 && !scanning
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        let width = clean.preferredWidth
+        clean.frame = NSRect(x: card.maxX - 12 - width, y: card.midY - 14, width: width, height: 28)
+        rescan.frame = NSRect(x: clean.frame.minX - 32, y: card.midY - 12, width: 26, height: 24)
+        spinner.frame = NSRect(x: clean.frame.minX - 28, y: card.midY - 8, width: 16, height: 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        Draw.card(card, radius: 16)
+        Draw.tile(symbol, in: NSRect(x: card.minX + 12, y: card.midY - 15, width: 30, height: 30), color: Term.accent)
+        Draw.text(title, font: termFont(13, .semibold), color: Term.ink,
+                  at: NSPoint(x: card.minX + 52, y: card.midY + 1))
+        Draw.text(subtitle, font: digitFont(11, .regular), color: Term.dim, at: NSPoint(x: card.minX + 52, y: card.midY - 15))
     }
 }
 
 final class StackBar: NSView {
     private var parts: [(CGFloat, NSColor)] = []
 
-    func set(bins: [CleanBin]) {
-        let total = bins.reduce(UInt64(0)) { $0 + $1.bytes }
-        parts = total == 0 ? [] : bins.enumerated().compactMap { index, bin in
-            guard bin.bytes > 0 else { return nil }
-            return (CGFloat(bin.bytes) / CGFloat(total), Term.bins[index % Term.bins.count])
+    // Up to six coloured parts, biggest first; the rest is merged into one grey part.
+    func set(groups: [CleanGroup]) {
+        let total = groups.reduce(UInt64(0)) { $0 + $1.bytes }
+        guard total > 0 else {
+            parts = []
+            needsDisplay = true
+            return
         }
+        let palette: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemPink, .systemOrange, .systemGreen]
+        let distinct = Set(groups.map { $0.color.description }).count == groups.count
+        let ranked = groups.count > 6 ? groups.sorted { $0.bytes > $1.bytes } : groups
+        parts = ranked.prefix(6).enumerated().map { index, group in
+            (CGFloat(group.bytes) / CGFloat(total), distinct && groups.count <= 6 ? group.color : palette[index])
+        }
+        let rest = ranked.dropFirst(6).reduce(UInt64(0)) { $0 + $1.bytes }
+        if rest > 0 { parts.append((CGFloat(rest) / CGFloat(total), NSColor.systemGray)) }
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let bar = bounds.insetBy(dx: Metrics.inset + 4, dy: 6)
+        let bar = bounds.insetBy(dx: Metrics.inset + 4, dy: 7)
         let shape = NSBezierPath(roundedRect: bar, xRadius: bar.height / 2, yRadius: bar.height / 2)
         Term.fill.setFill()
         shape.fill()
@@ -1972,70 +2660,947 @@ final class StackBar: NSView {
     }
 }
 
-final class StoragePane: NSView {
-    override var isFlipped: Bool { true }
-    var onClear: (CleanBin) -> Void = { _ in }
-    private var rows: [VolumeCard] = []
-    private var bins: [BinRow] = []
-    private let stack = StackBar()
-    private let cleanLabel = makeLabel(L("Clean up", "Opschonen"), size: 11, weight: .semibold, color: Term.dim)
-    private let totalLabel = makeLabel("", size: 11, weight: .semibold, color: Term.ink)
-    private let measuring = makeLabel(L("Measuring folders…", "Mappen meten…"), size: 12, weight: .medium, color: Term.dim)
-    private(set) var volumeCount = 0
-    private(set) var binCount = 0
+// One cleanup category. Click the circle to (de)select all of it, anywhere else to expand.
+final class CleanGroupRow: HoverView {
+    let group: CleanGroup
+    var state = 0 { didSet { needsDisplay = true } }
+    var selectedBytes: UInt64 = 0 { didSet { needsDisplay = true } }
+    var expanded = false
+    var onCheck: () -> Void = {}
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        totalLabel.alignment = .right
-        measuring.alignment = .center
-        addSubview(measuring)
-        addSubview(cleanLabel)
-        addSubview(totalLabel)
-        addSubview(stack)
+    private let icon: NSImage?
+
+    init(group: CleanGroup) {
+        self.group = group
+        icon = group.iconPath.map { NSWorkspace.shared.icon(forFile: $0) }
+        super.init(frame: .zero)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(group.title)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(volumes: [DiskVolume], bins found: [CleanBin]) {
-        if rows.count == volumes.count {
-            zip(rows, volumes).forEach { $0.update($1) }
+    private var card: NSRect { bounds.insetBy(dx: Metrics.inset, dy: 3) }
+    private var checkRect: NSRect { NSRect(x: card.minX + 6, y: card.midY - 12, width: 26, height: 24) }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        pressed = false
+        refresh()
+        guard bounds.contains(point) else { return }
+        if checkRect.insetBy(dx: -4, dy: -6).contains(point) { onCheck() } else { onClick() }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = self.card
+        Draw.card(card, hot: hovered || pressed)
+        drawCheck(state, in: checkRect)
+        let tile = NSRect(x: card.minX + 36, y: card.midY - 14, width: 28, height: 28)
+        if let icon {
+            icon.draw(in: tile.insetBy(dx: -2, dy: -2), from: .zero, operation: .sourceOver, fraction: 1)
         } else {
-            rows.forEach { $0.removeFromSuperview() }
-            rows = volumes.map(VolumeCard.init)
-            rows.forEach(addSubview)
+            Draw.tile(group.symbol, in: tile, color: group.color)
         }
-        bins.forEach { $0.removeFromSuperview() }
-        bins = found.enumerated().map { index, bin in
-            BinRow(bin: bin, color: Term.bins[index % Term.bins.count]) { [weak self] in self?.onClear(bin) }
+        let title = group.title as NSString
+        let titleAttrs: [NSAttributedString.Key: Any] = [.font: termFont(12.5, .semibold), .foregroundColor: Term.ink]
+        title.draw(with: NSRect(x: card.minX + 74, y: card.midY + 1, width: card.width - 74 - 110, height: 17),
+                   options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: titleAttrs)
+        let count = group.items.count
+        var sub = "\(count) " + (count == 1 ? L("item", "item") : L("items", "items"))
+        if let note = group.note {
+            sub += "  ·  " + note
+        } else if selectedBytes > 0 {
+            sub += "  ·  \(Scanner.formatBytes(selectedBytes)) " + L("selected", "geselecteerd")
         }
-        bins.forEach(addSubview)
-        stack.set(bins: found)
-        let total = found.reduce(UInt64(0)) { $0 + $1.bytes }
-        totalLabel.stringValue = found.isEmpty ? "" : Scanner.formatBytes(total) + " " + L("reclaimable", "vrij te maken")
-        measuring.isHidden = !found.isEmpty
-        volumeCount = volumes.count
-        binCount = found.count
+        Draw.text(sub, font: digitFont(10.5, .regular), color: Term.dim, at: NSPoint(x: card.minX + 74, y: card.midY - 14))
+
+        // Reclaimable size; a fully locked group (a running app) shows what it takes up.
+        let size = Scanner.formatBytes(group.bytes > 0 ? group.bytes : group.totalBytes)
+        let font = roundedFont(13, .semibold)
+        let width = Draw.width(size, font: font)
+        Draw.text(size, font: font, color: Term.ink, at: NSPoint(x: card.maxX - 32 - width, y: card.midY - 8))
+        drawSymbol(expanded ? "chevron.down" : "chevron.right", in: NSRect(x: card.maxX - 24, y: card.minY, width: 14, height: card.height),
+                   pointSize: 10, weight: .semibold, color: Term.dim)
+    }
+}
+
+// One thing that can be removed. Click to (de)select; hover for Reveal in Finder.
+final class CleanItemRow: HoverView {
+    let item: CleanItem
+    var checked = false { didSet { needsDisplay = true } }
+    private let title: NSTextField
+    private let detail: NSTextField
+    private let size: NSTextField
+    private var reveal: IconButton?
+    private var noteRect = NSRect.zero
+    private static let noteFont = termFont(10, .semibold)
+
+    init(item: CleanItem, reveal revealAction: @escaping (String) -> Void) {
+        self.item = item
+        title = makeLabel(item.title, size: 12, weight: .medium, color: Term.ink)
+        detail = makeLabel(item.detail, size: 10, weight: .regular, color: Term.dim)
+        detail.lineBreakMode = .byTruncatingMiddle
+        detail.cell?.lineBreakMode = .byTruncatingMiddle
+        size = makeLabel(Scanner.formatBytes(item.bytes), size: 12, weight: .semibold, color: Term.ink)
+        size.font = roundedFont(12, .semibold)
+        size.alignment = .right
+        super.init(frame: .zero)
+        toolTip = item.paths.count == 1 ? item.paths[0] : item.detail
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(item.title)
+        for view in [title, detail, size] { addSubview(view) }
+        if item.paths.count == 1, case .trash = item.action {
+            let path = item.paths[0]
+            let button = IconButton(symbol: "magnifyingglass", help: L("Show in Finder", "Toon in Finder")) { revealAction(path) }
+            button.isHidden = true
+            addSubview(button)
+            reveal = button
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func refresh() {
+        super.refresh()
+        reveal?.isHidden = !hovered
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if let reveal, !reveal.isHidden, reveal.frame.contains(local) { return reveal }
+        return self
+    }
+
+    override func layout() {
+        super.layout()
+        let right = bounds.width - Metrics.inset - 6
+        reveal?.frame = NSRect(x: right - 24, y: (bounds.height - 22) / 2, width: 24, height: 22)
+        size.frame = NSRect(x: right - 28 - 62, y: (bounds.height - 16) / 2, width: 62, height: 16)
+        var limit = size.frame.minX - 6
+        if let note = item.note {
+            let width = Draw.width(note, font: CleanItemRow.noteFont) + 12
+            noteRect = NSRect(x: limit - width, y: (bounds.height - 16) / 2, width: width, height: 16)
+            limit = noteRect.minX - 6
+        } else {
+            noteRect = .zero
+        }
+        let left = Metrics.inset + 40
+        title.frame = NSRect(x: left, y: bounds.height / 2, width: max(30, limit - left), height: 15)
+        detail.frame = NSRect(x: left, y: bounds.height / 2 - 14, width: max(30, limit - left), height: 13)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered || pressed {
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: Metrics.inset + 4, dy: 1), xRadius: 10, yRadius: 10)
+            Term.fill.setFill()
+            path.fill()
+        }
+        let checkRect = NSRect(x: Metrics.inset + 14, y: bounds.midY - 10, width: 20, height: 20)
+        if item.locked {
+            drawSymbol("lock.fill", in: checkRect, pointSize: 11, weight: .semibold, color: Term.faint)
+        } else {
+            drawCheck(checked ? 2 : 0, in: checkRect)
+        }
+        guard let note = item.note, noteRect.width > 0 else { return }
+        let color: NSColor
+        switch item.noteStyle {
+        case .good: color = .systemGreen
+        case .danger: color = .systemRed
+        case .plain: color = Term.dim
+        }
+        let pill = NSBezierPath(roundedRect: noteRect, xRadius: 8, yRadius: 8)
+        (item.noteStyle == .plain ? Term.fill : color.withAlphaComponent(0.16)).setFill()
+        pill.fill()
+        Draw.text(note, font: CleanItemRow.noteFont, color: color, centeredAt: NSPoint(x: noteRect.midX, y: noteRect.midY))
+    }
+}
+
+final class SortChip: HoverView {
+    let title: String
+    var on = false { didSet { needsDisplay = true } }
+    private static let font = termFont(11, .semibold)
+    var preferredWidth: CGFloat { Draw.width(title, font: SortChip.font) + 18 }
+
+    init(_ title: String) {
+        self.title = title
+        super.init(frame: .zero)
+        setAccessibilityRole(.radioButton)
+        setAccessibilityLabel(title)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        if on {
+            Term.accent.withAlphaComponent(0.2).setFill()
+            path.fill()
+        } else if hovered {
+            Term.fill.setFill()
+            path.fill()
+        }
+        Draw.text(title, font: SortChip.font, color: on ? Term.accent : Term.dim, centeredAt: NSPoint(x: bounds.midX, y: bounds.midY))
+    }
+}
+
+// Search field and sort choice for the project leftovers list.
+final class CleanFilterRow: NSView, NSTextFieldDelegate {
+    enum Sort: Int { case size, age, name }
+    var onChange: (String, Sort) -> Void = { _, _ in }
+    private let field = NSTextField()
+    private var chips: [SortChip] = []
+    private var sort = Sort.size
+
+    init(placeholder: String) {
+        super.init(frame: .zero)
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = termFont(12, .medium)
+        field.textColor = Term.ink
+        field.placeholderString = placeholder
+        field.delegate = self
+        addSubview(field)
+        for (index, title) in [L("Size", "Grootte"), L("Age", "Leeftijd"), L("Name", "Naam")].enumerated() {
+            let chip = SortChip(title)
+            chip.on = index == sort.rawValue
+            chip.onClick = { [weak self] in self?.choose(Sort(rawValue: index) ?? .size) }
+            chips.append(chip)
+            addSubview(chip)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc func controlTextDidChange(_ obj: Notification) {
+        onChange(field.stringValue, sort)
+    }
+
+    private func choose(_ next: Sort) {
+        sort = next
+        for (index, chip) in chips.enumerated() { chip.on = index == next.rawValue }
+        onChange(field.stringValue, sort)
+    }
+
+    private var searchRect: NSRect {
+        let chipsWidth = chips.reduce(CGFloat(0)) { $0 + $1.preferredWidth + 2 }
+        return NSRect(x: Metrics.inset + 10, y: (bounds.height - 28) / 2, width: bounds.width - Metrics.inset * 2 - 26 - chipsWidth, height: 28)
+    }
+
+    override func layout() {
+        super.layout()
+        let search = searchRect
+        field.frame = NSRect(x: search.minX + 30, y: search.midY - 8.5, width: search.width - 40, height: 17)
+        var x = search.maxX + 8
+        for chip in chips {
+            chip.frame = NSRect(x: x, y: (bounds.height - 24) / 2, width: chip.preferredWidth, height: 24)
+            x += chip.preferredWidth + 2
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let search = searchRect
+        let path = NSBezierPath(roundedRect: search, xRadius: search.height / 2, yRadius: search.height / 2)
+        Term.fill.setFill()
+        path.fill()
+        drawSymbol("magnifyingglass", in: NSRect(x: search.minX + 9, y: search.minY, width: 16, height: search.height),
+                   pointSize: 11, weight: .semibold, color: Term.dim)
+    }
+}
+
+// What a cleanup list shows and how it scans. Cleanup, large files, apps and duplicates are all one of these.
+struct CleanListConfig {
+    let title: String
+    let symbol: String
+    let idle: String          // subtitle before the first scan
+    let searchPlaceholder: String
+    let filterable: Set<String>   // groups that get a search/sort row when expanded
+    let expanded: Set<String>     // groups that start expanded
+    let order: [String]           // group order while results stream in
+}
+
+typealias CleanScanWork = (@escaping (CleanGroup) -> Void) -> [CleanGroup]
+
+// A scannable list of groups with checkboxes, a summary header and one Clean button.
+final class CleanListView: NSView {
+    override var isFlipped: Bool { true }
+    var makeScan: () -> CleanScanWork = { { _ in [] } }  // called on the main thread; the work runs in the background
+    var onClean: ([CleanItem], @escaping (Set<String>) -> Void) -> Void = { _, _ in }
+    var onReveal: (String) -> Void = { _ in }
+    var onResize: () -> Void = {}
+    private let config: CleanListConfig
+    private let header: CleanHeader
+    private let stack = StackBar()
+    private let placeholder = makeLabel("", size: 12, weight: .medium, color: Term.dim)
+    private let filterRow: CleanFilterRow
+    private var groups: [CleanGroup] = []
+    private var scanning = false
+    private var scanned = false
+    private var selected = Set<String>()
+    private var known = Set<String>()
+    private var expanded: Set<String>
+    private var groupRows: [String: CleanGroupRow] = [:]
+    private var itemRows: [String: CleanItemRow] = [:]
+    private var rows: [NSView] = []
+    private var query = ""
+    private var sort = CleanFilterRow.Sort.size
+
+    init(config: CleanListConfig) {
+        self.config = config
+        expanded = config.expanded
+        header = CleanHeader(title: config.title, symbol: config.symbol, idle: config.idle)
+        filterRow = CleanFilterRow(placeholder: config.searchPlaceholder)
+        super.init(frame: .zero)
+        placeholder.alignment = .center
+        header.onClean = { [weak self] in self?.cleanSelected() }
+        header.onRescan = { [weak self] in self?.startScan() }
+        filterRow.onChange = { [weak self] query, sort in
+            guard let self else { return }
+            self.query = query
+            self.sort = sort
+            self.rebuildRows()
+            self.onResize()
+        }
+        addSubview(header)
+        addSubview(stack)
+        addSubview(placeholder)
+        rebuildRows()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    var contentHeight: CGFloat {
+        var height = Metrics.cleanHeader + 22
+        if rows.isEmpty {
+            height += Metrics.groupRow
+        } else {
+            for row in rows { height += rowHeight(row) }
+        }
+        return height + Metrics.listPad * 2
+    }
+
+    // MARK: Scanning
+
+    func startScan() {
+        guard !scanning else { return }
+        scanning = true
+        scanned = true
+        let work = makeScan()
+        rebuildRows()
+        onResize()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found = work { group in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.scanning else { return }
+                    self.groups.removeAll { $0.id == group.id }
+                    if !group.items.isEmpty { self.groups.append(group) }
+                    let order = self.config.order
+                    if order.isEmpty {
+                        self.groups.sort { $0.bytes > $1.bytes }
+                    } else {
+                        self.groups.sort { (order.firstIndex(of: $0.id) ?? 99) < (order.firstIndex(of: $1.id) ?? 99) }
+                    }
+                    self.apply()
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.scanning = false
+                self.groups = found
+                self.apply()
+            }
+        }
+    }
+
+    // New items start with their default selection; the user's own choices are kept across scans.
+    private func apply() {
+        for item in groups.flatMap(\.items) where known.insert(item.id).inserted && item.preselect && !item.locked {
+            selected.insert(item.id)
+        }
+        if !scanning {
+            let present = Set(groups.flatMap { $0.items.map(\.id) })
+            selected.formIntersection(present)
+            known.formIntersection(present)
+        }
+        rebuildRows()
+        onResize()
+    }
+
+    // MARK: Rows
+
+    private func rowHeight(_ row: NSView) -> CGFloat {
+        if row is CleanGroupRow { return Metrics.groupRow }
+        if row === filterRow { return Metrics.filterRow }
+        return Metrics.itemRow
+    }
+
+    private func visibleItems(_ group: CleanGroup) -> [CleanItem] {
+        guard config.filterable.contains(group.id) else { return group.items }
+        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
+        let matched = needle.isEmpty ? group.items : group.items.filter {
+            $0.title.lowercased().contains(needle) || $0.detail.lowercased().contains(needle)
+        }
+        switch sort {
+        case .size: return matched.sorted { $0.bytes > $1.bytes }
+        case .age: return matched.sorted { ($0.age ?? 0) > ($1.age ?? 0) }
+        case .name: return matched.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        }
+    }
+
+    private func rebuildRows() {
+        // The filter row is reused, so its search field keeps focus while typing.
+        rows.filter { $0 !== filterRow }.forEach { $0.removeFromSuperview() }
+        rows = []
+        groupRows = [:]
+        itemRows = [:]
+        for group in groups {
+            let row = CleanGroupRow(group: group)
+            row.expanded = expanded.contains(group.id)
+            row.onClick = { [weak self] in self?.toggleExpanded(group.id) }
+            row.onCheck = { [weak self] in self?.toggleGroup(group) }
+            groupRows[group.id] = row
+            rows.append(row)
+            guard row.expanded else { continue }
+            if config.filterable.contains(group.id) { rows.append(filterRow) }
+            for item in visibleItems(group) {
+                let itemRow = CleanItemRow(item: item) { [weak self] in self?.onReveal($0) }
+                itemRow.onClick = { [weak self] in self?.toggleItem(item) }
+                itemRows[item.id] = itemRow
+                rows.append(itemRow)
+            }
+        }
+        if !rows.contains(where: { $0 === filterRow }) { filterRow.removeFromSuperview() }
+        rows.filter { $0.superview == nil }.forEach(addSubview)
+        if scanning {
+            placeholder.stringValue = L("Scanning…", "Scannen…")
+        } else if !scanned {
+            placeholder.stringValue = L("Press Scan to start", "Druk op Scannen om te beginnen")
+        } else {
+            placeholder.stringValue = L("Nothing found", "Niets gevonden")
+        }
+        placeholder.isHidden = !rows.isEmpty
+        stack.set(groups: groups)
+        refreshChecks()
         needsLayout = true
+    }
+
+    private func refreshChecks() {
+        var selectedBytes: UInt64 = 0
+        var count = 0
+        for group in groups {
+            let open = group.items.filter { !$0.locked }
+            let picked = open.filter { selected.contains($0.id) }
+            let bytes = picked.reduce(UInt64(0)) { $0 + $1.bytes }
+            groupRows[group.id]?.state = picked.isEmpty ? 0 : (picked.count == open.count ? 2 : 1)
+            groupRows[group.id]?.selectedBytes = bytes
+            selectedBytes += bytes
+            count += picked.count
+        }
+        for (id, row) in itemRows { row.checked = selected.contains(id) }
+        let found = groups.reduce(UInt64(0)) { $0 + $1.bytes }
+        header.set(found: found, selected: selectedBytes, count: count, scanning: scanning, scanned: scanned)
+    }
+
+    private func toggleItem(_ item: CleanItem) {
+        guard !item.locked else { return }
+        if selected.contains(item.id) { selected.remove(item.id) } else { selected.insert(item.id) }
+        refreshChecks()
+    }
+
+    // Acts on what is shown, so a search narrows what gets (de)selected. Locked items are never selected.
+    private func toggleGroup(_ group: CleanGroup) {
+        let ids = (expanded.contains(group.id) ? visibleItems(group) : group.items).filter { !$0.locked }.map(\.id)
+        guard !ids.isEmpty else { return }
+        if ids.allSatisfy(selected.contains) {
+            ids.forEach { selected.remove($0) }
+        } else {
+            ids.forEach { selected.insert($0) }
+        }
+        refreshChecks()
+    }
+
+    private func toggleExpanded(_ id: String) {
+        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+        rebuildRows()
+        onResize()
+    }
+
+    private func cleanSelected() {
+        let items = groups.flatMap(\.items).filter { selected.contains($0.id) && !$0.locked }
+        guard !items.isEmpty else { return }
+        onClean(items) { [weak self] cleaned in
+            guard let self, !cleaned.isEmpty else { return }
+            // Drop what is gone instead of rescanning; Scan again refreshes everything.
+            self.groups = self.groups.compactMap { group in
+                var group = group
+                group.items.removeAll { cleaned.contains($0.id) }
+                return group.items.contains(where: { !$0.locked }) ? group : nil
+            }
+            self.selected.subtract(cleaned)
+            self.rebuildRows()
+            self.onResize()
+        }
     }
 
     override func layout() {
         super.layout()
         var y = Metrics.listPad
-        for row in rows {
-            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.volume)
-            y += Metrics.volume
-        }
-        if rows.isEmpty { y += Metrics.volume }
-        cleanLabel.frame = NSRect(x: Metrics.inset + 6, y: y + 10, width: 160, height: 14)
-        totalLabel.frame = NSRect(x: bounds.width - Metrics.inset - 6 - 200, y: y + 10, width: 200, height: 14)
-        y += Metrics.section
+        header.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.cleanHeader)
+        y += Metrics.cleanHeader
         stack.frame = NSRect(x: 0, y: y, width: bounds.width, height: 22)
         y += 22
-        measuring.frame = NSRect(x: 16, y: y + (Metrics.bin - 16) / 2, width: max(0, bounds.width - 32), height: 16)
-        for row in bins {
-            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.bin)
-            y += Metrics.bin
+        placeholder.frame = NSRect(x: 16, y: y + (Metrics.groupRow - 16) / 2, width: max(0, bounds.width - 32), height: 16)
+        for row in rows {
+            let height = rowHeight(row)
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: height)
+            y += height
         }
+    }
+}
+
+// MARK: - Space explorer
+
+final class ExplorerRow: HoverView {
+    struct Entry {
+        let name: String
+        let path: String
+        let isFolder: Bool
+        var bytes: UInt64?
+    }
+
+    private(set) var entry: Entry
+    var fraction: Double = 0 { didSet { needsDisplay = true } }
+    private let icon: NSImage
+    private let name: NSTextField
+    private let size: NSTextField
+    private let reveal: IconButton
+    private let trash: IconButton
+
+    init(entry: Entry, reveal revealAction: @escaping (String) -> Void, trash trashAction: @escaping (Entry) -> Void) {
+        self.entry = entry
+        icon = NSWorkspace.shared.icon(forFile: entry.path)
+        name = makeLabel(entry.name, size: 12, weight: .medium, color: Term.ink)
+        size = makeLabel("", size: 12, weight: .semibold, color: Term.ink)
+        size.font = roundedFont(12, .semibold)
+        size.alignment = .right
+        reveal = IconButton(symbol: "magnifyingglass", help: L("Show in Finder", "Toon in Finder")) { revealAction(entry.path) }
+        trash = IconButton(symbol: "trash", help: L("Move to Trash…", "Naar prullenmand…"), destructive: true) { trashAction(entry) }
+        super.init(frame: .zero)
+        toolTip = entry.path
+        for view in [name, size, reveal, trash] as [NSView] { addSubview(view) }
+        reveal.isHidden = true
+        trash.isHidden = true
+        update(entry.bytes)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(_ bytes: UInt64?) {
+        entry.bytes = bytes
+        size.stringValue = bytes.map(Scanner.formatBytes) ?? "…"
+        size.textColor = bytes == nil ? Term.faint : Term.ink
+    }
+
+    override func resetCursorRects() {
+        if entry.isFolder { super.resetCursorRects() }
+    }
+
+    override func refresh() {
+        super.refresh()
+        reveal.isHidden = !hovered
+        trash.isHidden = !hovered
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        for button in [reveal, trash] where !button.isHidden && button.frame.contains(local) { return button }
+        return self
+    }
+
+    override func layout() {
+        super.layout()
+        let right = bounds.width - Metrics.inset - 22
+        size.frame = NSRect(x: right - 64, y: (bounds.height - 16) / 2, width: 64, height: 16)
+        trash.frame = NSRect(x: size.frame.minX - 28, y: (bounds.height - 22) / 2, width: 24, height: 22)
+        reveal.frame = NSRect(x: trash.frame.minX - 26, y: (bounds.height - 22) / 2, width: 24, height: 22)
+        let left = Metrics.inset + 46
+        name.frame = NSRect(x: left, y: bounds.height / 2 - 1, width: max(30, reveal.frame.minX - left - 6), height: 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered || pressed {
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: Metrics.inset, dy: 1), xRadius: 10, yRadius: 10)
+            Term.fill.setFill()
+            path.fill()
+        }
+        icon.draw(in: NSRect(x: Metrics.inset + 12, y: bounds.midY - 13, width: 26, height: 26), from: .zero, operation: .sourceOver, fraction: 1)
+        // Share of the largest item in this folder
+        let left = Metrics.inset + 46
+        let bar = NSRect(x: left, y: bounds.midY - 9, width: max(10, size.frame.minX - 60 - left), height: 4)
+        Term.fill.setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
+        if fraction > 0 {
+            var filled = bar
+            filled.size.width = max(bar.height, bar.width * CGFloat(min(1, fraction)))
+            Term.accent.setFill()
+            NSBezierPath(roundedRect: filled, xRadius: 2, yRadius: 2).fill()
+        }
+        if entry.isFolder {
+            drawSymbol("chevron.right", in: NSRect(x: bounds.width - Metrics.inset - 20, y: 0, width: 12, height: bounds.height),
+                       pointSize: 10, weight: .semibold, color: Term.dim)
+        }
+    }
+}
+
+final class ExplorerHeader: NSView {
+    var onBack: () -> Void = {}
+    private lazy var back = IconButton(symbol: "chevron.left", help: L("Back", "Terug")) { [weak self] in self?.onBack() }
+    private let spinner = NSProgressIndicator()
+    private var title = ""
+    private var subtitle = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        addSubview(back)
+        addSubview(spinner)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func set(title: String, subtitle: String, canGoBack: Bool, busy: Bool) {
+        self.title = title
+        self.subtitle = subtitle
+        back.isHidden = !canGoBack
+        if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        needsDisplay = true
+    }
+
+    private var textX: CGFloat { back.isHidden ? Metrics.inset + 52 : Metrics.inset + 80 }
+
+    override func layout() {
+        super.layout()
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        back.frame = NSRect(x: card.minX + 10, y: card.midY - 13, width: 26, height: 26)
+        spinner.frame = NSRect(x: card.maxX - 30, y: card.midY - 8, width: 16, height: 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        Draw.card(card, radius: 16)
+        let tileX = back.isHidden ? card.minX + 12 : card.minX + 40
+        Draw.tile("chart.pie.fill", in: NSRect(x: tileX, y: card.midY - 15, width: 30, height: 30), color: Term.accent)
+        let x = tileX + 40
+        let attrs: [NSAttributedString.Key: Any] = [.font: termFont(13, .semibold), .foregroundColor: Term.ink]
+        (title as NSString).draw(with: NSRect(x: x, y: card.midY + 1, width: card.maxX - 40 - x, height: 17),
+                                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
+        let subAttrs: [NSAttributedString.Key: Any] = [.font: digitFont(11, .regular), .foregroundColor: Term.dim]
+        (subtitle as NSString).draw(with: NSRect(x: x, y: card.midY - 15, width: card.maxX - 40 - x, height: 15),
+                                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: subAttrs)
+    }
+}
+
+// Measures a folder's contents, biggest first; click a folder to go in. Starts in your home folder.
+final class ExplorerView: NSView {
+    override var isFlipped: Bool { true }
+    var onReveal: (String) -> Void = { _ in }
+    var onTrash: ([CleanItem], @escaping (Set<String>) -> Void) -> Void = { _, _ in }
+    var onResize: () -> Void = {}
+    private let home = NSHomeDirectory()
+    private var path = NSHomeDirectory()
+    private var rows: [ExplorerRow] = []
+    private let header = ExplorerHeader()
+    private let placeholder = makeLabel(L("Empty folder", "Lege map"), size: 12, weight: .medium, color: Term.dim)
+    private var sizes: [String: UInt64] = [:]  // kept while iServer runs, so going back is instant
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 3
+        queue.qualityOfService = .utility
+        return queue
+    }()
+    private var generation = 0
+    private var started = false
+    private var pending = 0
+    private var resortScheduled = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        placeholder.alignment = .center
+        header.onBack = { [weak self] in
+            guard let self else { return }
+            self.open((self.path as NSString).deletingLastPathComponent)
+        }
+        addSubview(header)
+        addSubview(placeholder)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    var contentHeight: CGFloat {
+        Metrics.cleanHeader + CGFloat(max(rows.count, 1)) * Metrics.explorerRow + Metrics.listPad * 2
+    }
+
+    func start() {
+        guard !started else { return }
+        started = true
+        open(home)
+    }
+
+    private func open(_ target: String) {
+        generation += 1
+        let current = generation
+        queue.cancelAllOperations()
+        path = target
+        rows.forEach { $0.removeFromSuperview() }
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .isPackageKey]
+        let entries = DevClean.children(of: target).compactMap { child -> ExplorerRow.Entry? in
+            guard let values = try? URL(fileURLWithPath: child).resourceValues(forKeys: keys), values.isSymbolicLink != true else { return nil }
+            let folder = values.isDirectory == true && values.isPackage != true
+            return ExplorerRow.Entry(name: (child as NSString).lastPathComponent, path: child, isFolder: folder, bytes: sizes[child])
+        }
+        rows = entries.map { entry in
+            let row = ExplorerRow(entry: entry, reveal: { [weak self] in self?.onReveal($0) }, trash: { [weak self] in self?.trash($0) })
+            if entry.isFolder { row.onClick = { [weak self] in self?.open(entry.path) } }
+            return row
+        }
+        rows.forEach(addSubview)
+        resort()
+        onResize()
+
+        let missing = entries.filter { $0.bytes == nil }
+        pending = missing.count
+        updateHeader()
+        for entry in missing {
+            let operation = BlockOperation()
+            operation.addExecutionBlock { [weak self, weak operation] in
+                let bytes = DevClean.allocatedSize(entry.path, cancelled: { operation?.isCancelled ?? true })
+                guard operation?.isCancelled == false else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.generation == current else { return }
+                    self.sizes[entry.path] = bytes
+                    self.rows.first { $0.entry.path == entry.path }?.update(bytes)
+                    self.pending -= 1
+                    self.scheduleResort()
+                }
+            }
+            queue.addOperation(operation)
+        }
+    }
+
+    // Results arrive one by one; reorder at most a few times a second.
+    private func scheduleResort() {
+        updateHeader()
+        guard !resortScheduled else { return }
+        resortScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.resortScheduled = false
+            self?.resort()
+        }
+    }
+
+    private func resort() {
+        rows.sort { lhs, rhs in
+            switch (lhs.entry.bytes, rhs.entry.bytes) {
+            case let (l?, r?): return l > r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return lhs.entry.name.localizedCaseInsensitiveCompare(rhs.entry.name) == .orderedAscending
+            }
+        }
+        let largest = Double(rows.compactMap(\.entry.bytes).max() ?? 0)
+        for row in rows { row.fraction = largest > 0 ? Double(row.entry.bytes ?? 0) / largest : 0 }
+        placeholder.isHidden = !rows.isEmpty
+        needsLayout = true
+    }
+
+    private func updateHeader() {
+        let total = rows.compactMap(\.entry.bytes).reduce(0, +)
+        let name = path == home ? L("Home folder", "Thuismap") : (path as NSString).lastPathComponent
+        var subtitle = DevClean.tilde(path) + "  ·  " + Scanner.formatBytes(total)
+        if pending > 0 { subtitle += "  ·  " + L("measuring \(pending)…", "\(pending) meten…") }
+        header.set(title: name, subtitle: subtitle, canGoBack: path != home && path.hasPrefix(home), busy: pending > 0)
+    }
+
+    private func trash(_ entry: ExplorerRow.Entry) {
+        let item = CleanItem(id: "explore." + entry.path, title: entry.name, detail: DevClean.tilde(entry.path), paths: [entry.path],
+                             bytes: entry.bytes ?? 0, preselect: false, action: .trash)
+        onTrash([item]) { [weak self] cleaned in
+            guard let self, !cleaned.isEmpty else { return }
+            self.rows.first { $0.entry.path == entry.path }?.removeFromSuperview()
+            self.rows.removeAll { $0.entry.path == entry.path }
+            // Folders above it shrank; measure them again when visited.
+            self.sizes = self.sizes.filter { !entry.path.hasPrefix($0.key + "/") && $0.key != entry.path }
+            self.resort()
+            self.updateHeader()
+            self.onResize()
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        var y = Metrics.listPad
+        header.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.cleanHeader)
+        y += Metrics.cleanHeader
+        placeholder.frame = NSRect(x: 16, y: y + (Metrics.explorerRow - 16) / 2, width: max(0, bounds.width - 32), height: 16)
+        for row in rows {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.explorerRow)
+            y += Metrics.explorerRow
+        }
+    }
+}
+
+// MARK: - Storage tab
+
+// Switches between the storage tools.
+final class ModeBar: NSView {
+    var onSelect: (Int) -> Void = { _ in }
+    private var chips: [SortChip] = []
+
+    init(titles: [String]) {
+        super.init(frame: .zero)
+        for (index, title) in titles.enumerated() {
+            let chip = SortChip(title)
+            chip.on = index == 0
+            chip.onClick = { [weak self] in self?.select(index) }
+            chips.append(chip)
+            addSubview(chip)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func select(_ index: Int) {
+        for (i, chip) in chips.enumerated() { chip.on = i == index }
+        onSelect(index)
+    }
+
+    override func layout() {
+        super.layout()
+        let track = bounds.insetBy(dx: Metrics.inset + 2, dy: 6)
+        let width = track.width / CGFloat(max(chips.count, 1))
+        for (index, chip) in chips.enumerated() {
+            chip.frame = NSRect(x: track.minX + CGFloat(index) * width, y: track.minY, width: width - 2, height: track.height)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        let path = NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2)
+        Term.fill.setFill()
+        path.fill()
+    }
+}
+
+final class StoragePane: NSView {
+    override var isFlipped: Bool { true }
+    var onClean: ([CleanItem], @escaping (Set<String>) -> Void) -> Void = { _, _ in }
+    var onReveal: (String) -> Void = { _ in }
+    var onResize: () -> Void = {}
+    var runningFolders: () -> [String] = { [] }
+    private var cards: [VolumeCard] = []
+    private let modes = ModeBar(titles: [L("Cleanup", "Opschonen"), L("Explorer", "Verkenner"), L("Large", "Groot"),
+                                         L("Apps", "Apps"), L("Duplicates", "Dubbel")])
+    private let explorer = ExplorerView()
+    private var lists: [CleanListView] = []
+    private var mode = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let cleanup = CleanListView(config: CleanListConfig(
+            title: L("Developer cleanup", "Opschonen voor developers"), symbol: "sparkles",
+            idle: L("Find caches and build folders you can remove", "Zoek caches en buildmappen die weg kunnen"),
+            searchPlaceholder: L("Search projects", "Zoek projecten"), filterable: ["projects"], expanded: [],
+            order: DevClean.order))
+        cleanup.makeScan = { [weak self] in
+            let running = self?.runningFolders() ?? []
+            return { onGroup in DevClean.scan(running: running, onGroup: onGroup) }
+        }
+        let large = CleanListView(config: CleanListConfig(
+            title: L("Large & old files", "Grote en oude bestanden"), symbol: "doc.fill",
+            idle: L("Files over 100 MB, or untouched for a year, in your folders", "Bestanden boven 100 MB, of een jaar niet aangeraakt"),
+            searchPlaceholder: L("Search files", "Zoek bestanden"), filterable: ["large"], expanded: ["large"], order: []))
+        large.makeScan = { { _ in StorageTools.largeFiles() } }
+        let apps = CleanListView(config: CleanListConfig(
+            title: L("Apps and leftovers", "Apps en resten"), symbol: "app.badge.checkmark",
+            idle: L("Remove apps with their files, and files of deleted apps", "Verwijder apps met hun bestanden, en resten van oude apps"),
+            searchPlaceholder: L("Search leftovers", "Zoek resten"), filterable: ["orphans"], expanded: [], order: []))
+        apps.makeScan = {
+            let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+            return { _ in StorageTools.apps(running: running) }
+        }
+        let duplicates = CleanListView(config: CleanListConfig(
+            title: L("Duplicate files", "Dubbele bestanden"), symbol: "doc.on.doc.fill",
+            idle: L("Identical files in your folders; one copy is always kept", "Identieke bestanden; er blijft altijd één over"),
+            searchPlaceholder: "", filterable: [], expanded: [], order: []))
+        duplicates.makeScan = { { onGroup in StorageTools.duplicates(onGroup: onGroup) } }
+        lists = [cleanup, large, apps, duplicates]
+
+        for list in lists {
+            list.onClean = { [weak self] items, done in self?.onClean(items, done) }
+            list.onReveal = { [weak self] in self?.onReveal($0) }
+            list.onResize = { [weak self] in self?.contentChanged() }
+        }
+        explorer.onReveal = { [weak self] in self?.onReveal($0) }
+        explorer.onTrash = { [weak self] items, done in self?.onClean(items, done) }
+        explorer.onResize = { [weak self] in self?.contentChanged() }
+        modes.onSelect = { [weak self] in self?.show($0) }
+        addSubview(modes)
+        show(0)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Mode 0 cleanup, 1 explorer, 2 large files, 3 apps, 4 duplicates.
+    private var current: NSView { mode == 1 ? explorer : lists[mode == 0 ? 0 : mode - 1] }
+
+    private var currentHeight: CGFloat {
+        if mode == 1 { return explorer.contentHeight }
+        return lists[mode == 0 ? 0 : mode - 1].contentHeight
+    }
+
+    var contentHeight: CGFloat {
+        Metrics.listPad + CGFloat(max(cards.count, 1)) * Metrics.volume + Metrics.modeBar + currentHeight + Metrics.listPad
+    }
+
+    private func show(_ index: Int) {
+        mode = index
+        if current.superview == nil { addSubview(current) }
+        for view in [explorer] + lists as [NSView] where view !== current { view.removeFromSuperview() }
+        if mode == 1 { explorer.start() }
+        contentChanged()
+    }
+
+    private func contentChanged() {
+        needsLayout = true
+        onResize()
+    }
+
+    func showVolumes(_ volumes: [DiskVolume]) {
+        if cards.count == volumes.count {
+            zip(cards, volumes).forEach { $0.update($1) }
+        } else {
+            cards.forEach { $0.removeFromSuperview() }
+            cards = volumes.map(VolumeCard.init)
+            cards.forEach(addSubview)
+            contentChanged()
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        var y = Metrics.listPad
+        for card in cards {
+            card.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.volume)
+            y += Metrics.volume
+        }
+        if cards.isEmpty { y += Metrics.volume }
+        modes.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.modeBar)
+        y += Metrics.modeBar
+        current.frame = NSRect(x: 0, y: y, width: bounds.width, height: currentHeight)
     }
 }
 
@@ -2222,7 +3787,8 @@ final class BoardView: NSView {
     var quit: () -> Void = {}
     var onPage: () -> Void = {}
     var relayout: () -> Void = {}
-    var clearBin: (CleanBin) -> Void = { _ in }
+    var cleanItems: ([CleanItem], @escaping (Set<String>) -> Void) -> Void = { _, _ in }
+    var runningFolders: () -> [String] = { [] }
     var copyClip: (ClipItem) -> Void = { _ in }
     var pinClip: (ClipItem) -> Void = { _ in }
     private(set) var page = 0
@@ -2278,7 +3844,13 @@ final class BoardView: NSView {
         storageScroll.documentView = storage
         configure(clipScroll)
         clipScroll.documentView = clips
-        storage.onClear = { [weak self] in self?.clearBin($0) }
+        storage.onClean = { [weak self] items, done in self?.cleanItems(items, done) }
+        storage.runningFolders = { [weak self] in self?.runningFolders() ?? [] }
+        storage.onReveal = { [weak self] in self?.reveal($0) }
+        storage.onResize = { [weak self] in
+            self?.needsLayout = true
+            self?.relayout()
+        }
         clips.onCopy = { [weak self] in self?.copyClip($0) }
         clips.onPin = { [weak self] in self?.pinClip($0) }
         clips.onFilter = { [weak self] in self?.relayout() }
@@ -2353,7 +3925,7 @@ final class BoardView: NSView {
         hero.set(groups: groups, vitals: vitals, disk: disk)
     }
 
-    func update(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume], bins: [CleanBin],
+    func update(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume],
                 includeApps: Bool, login: Bool, lan: String?) {
         pendingScroll = scroll.contentView.bounds.origin
         let known = Set(rows.map(\.groupID))
@@ -2377,19 +3949,19 @@ final class BoardView: NSView {
         }
         setHero(groups: groups, vitals: vitals, disk: volumes.first)
         if page == 1 { activity.show(vitals: vitals, trace: trace, groups: groups) }
-        if page == 2 { storage.show(volumes: volumes, bins: bins) }
+        storage.showVolumes(volumes)
         setToggles(apps: includeApps, login: login)
         applyPage()
         needsLayout = true
     }
 
-    func refreshStats(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume], bins: [CleanBin]) {
+    func refreshStats(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume]) {
         setHero(groups: groups, vitals: vitals, disk: volumes.first)
         switch page {
         case 1:
             activity.show(vitals: vitals, trace: trace, groups: groups)
         case 2:
-            storage.show(volumes: volumes, bins: bins)
+            storage.showVolumes(volumes)
         default:
             for group in groups {
                 rows.first { $0.groupID == group.id }?.applyStats(group, history: history[group.id] ?? [])
@@ -2401,7 +3973,7 @@ final class BoardView: NSView {
     func bodyHeight(maxHeight: CGFloat) -> CGFloat {
         switch page {
         case 1: return Metrics.capped(Metrics.activityHeight(count: rows.count), maxHeight: maxHeight)
-        case 2: return Metrics.capped(Metrics.storageHeight(volumes: storage.volumeCount, bins: storage.binCount), maxHeight: maxHeight)
+        case 2: return Metrics.capped(storage.contentHeight, maxHeight: maxHeight)
         case 3: return Metrics.capped(Metrics.clipHeight(count: clips.shown), maxHeight: maxHeight)
         default: return Metrics.listHeight(count: rows.count, maxHeight: maxHeight)
         }
@@ -2415,11 +3987,6 @@ final class BoardView: NSView {
 
     func showClips(_ items: [ClipItem]) {
         clips.show(items)
-        needsLayout = true
-    }
-
-    func showStorage(volumes: [DiskVolume], bins: [CleanBin]) {
-        storage.show(volumes: volumes, bins: bins)
         needsLayout = true
     }
 
@@ -2491,7 +4058,7 @@ final class BoardView: NSView {
 
         let activityFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.activityHeight(count: rows.count))
         if activity.frame.integral != activityFrame.integral { activity.frame = activityFrame }
-        let storageFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.storageHeight(volumes: storage.volumeCount, bins: max(storage.binCount, 1)))
+        let storageFrame = NSRect(x: 0, y: 0, width: width, height: storage.contentHeight)
         if storage.frame.integral != storageFrame.integral { storage.frame = storageFrame }
         let clipFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.clipHeight(count: clips.shown))
         if clips.frame.integral != clipFrame.integral { clips.frame = clipFrame }
@@ -2513,16 +4080,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let panel = MenuPanel()
     private let board = BoardView()
     private let demo = CommandLine.arguments.contains("--demo")
+    private let keepOpen = CommandLine.arguments.contains("--keep-open")  // for screenshots: ignore clicks elsewhere
     private var groups: [ServerGroup] = []
     private var vitals = Vitals.empty
     private var volumes: [DiskVolume] = []
-    private var bins: [CleanBin] = []
-    private var sizing = false
     private let clips = ClipBook()
     private var lastSignature = ""
     private var scanning = false
-    private var junkAt: TimeInterval = 0
-    private var rescanJunk = false
     private var trace = Trace()
     private var cpuHistory: [Int32: [Double]] = [:]  // per server group, newest last
     private var menuCPU: [Double] = []  // system CPU 0...1 for the menu bar graph, newest last
@@ -2555,15 +4119,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         board.onPage = { [weak self] in
             guard let self else { return }
             self.placePanel(animated: true)
-            self.board.refreshStats(groups: self.groups, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes, bins: self.bins)
+            self.board.refreshStats(groups: self.groups, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes)
             self.setChartsRunning(self.board.page == 1)
             if self.board.page == 1 { self.refresh() }
-            if self.board.page == 2 {
-                self.refresh()
-                self.scanJunk(force: false)
-            }
+            if self.board.page == 2 { self.refresh() }
         }
-        board.clearBin = { [weak self] in self?.clearBin($0) }
+        board.cleanItems = { [weak self] items, done in self?.clean(items, done: done) }
+        board.runningFolders = { [weak self] in self?.groups.compactMap(\.folder) ?? [] }
         board.copyClip = { [weak self] item in
             self?.clips.copy(item)
             self?.closePanel()
@@ -2598,6 +4160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return nil
         }) { monitors.append(local) }
         if let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+            guard self?.keepOpen == false else { return }
             self?.closePanel()
         }) { monitors.append(global) }
 
@@ -2617,7 +4180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        guard ProcessInfo.processInfo.systemUptime - openedAt > 0.25 else { return }
+        guard !keepOpen, ProcessInfo.processInfo.systemUptime - openedAt > 0.25 else { return }
         closePanel()
     }
 
@@ -2743,7 +4306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if changed {
                     self.render()
                 } else {
-                    self.board.refreshStats(groups: result, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes, bins: self.bins)
+                    self.board.refreshStats(groups: result, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes)
                 }
                 // This scan started while the panel was closed, so it has no system stats yet.
                 if vitals == nil {
@@ -2787,7 +4350,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             history: cpuHistory,
             vitals: vitals,
             volumes: volumes,
-            bins: bins,
             includeApps: includeApps,
             login: SMAppService.mainApp.status == .enabled,
             lan: lan)
@@ -2804,49 +4366,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         clips.copyString(string)
     }
 
-    private func scanJunk(force: Bool) {
-        let now = ProcessInfo.processInfo.systemUptime
-        guard force || now - junkAt > 90 else { return }
-        guard !sizing else {
-            // A scan is already running; run a fresh one after it so its stale sizes don't win.
-            if force { rescanJunk = true }
-            return
-        }
-        sizing = true
-        junkAt = now
-        DispatchQueue.global(qos: .utility).async {
-            let found = Junk.scan()
-            DispatchQueue.main.async {
-                self.sizing = false
-                if self.rescanJunk {
-                    self.rescanJunk = false
-                    self.scanJunk(force: true)
-                    return
-                }
-                self.bins = found
-                guard self.panel.isVisible, self.board.page == 2 else { return }
-                self.board.showStorage(volumes: self.volumes, bins: found)
-                self.placePanel(animated: true)
-            }
-        }
-    }
-
-    private func clearBin(_ bin: CleanBin) {
+    // Confirms, moves the items to the Trash (or runs their command), reports, then tells the caller what is gone.
+    private func clean(_ items: [CleanItem], done finished: @escaping (Set<String>) -> Void) {
         closePanel()
+        let total = items.reduce(UInt64(0)) { $0 + $1.bytes }
+        let permanent = items.filter(\.permanent)
+        var lines = items.prefix(8).map { "• \($0.title)  \(Scanner.formatBytes($0.bytes))" }
+        if items.count > 8 { lines.append(L("… and \(items.count - 8) more", "… en nog \(items.count - 8)")) }
+        lines.append("")
+        lines.append(L("Everything goes to the Trash, so you can still put it back. Empty the Trash to free the space.",
+                       "Alles gaat naar de prullenmand, dus je kunt het nog terugzetten. Leeg de prullenmand om de ruimte vrij te maken."))
+        if !permanent.isEmpty {
+            lines.append(L("Except: \(permanent.map(\.title).joined(separator: ", ")). Those are removed permanently.",
+                           "Behalve: \(permanent.map(\.title).joined(separator: ", ")). Die worden definitief verwijderd."))
+        }
         let alert = NSAlert()
-        alert.messageText = L("Clear \(bin.title)?", "\(bin.title) legen?")
-        alert.informativeText = bin.id == "trash"
-            ? L("Empties the Trash. This cannot be undone.", "Leegt de prullenmand. Dit kan niet ongedaan worden.")
-            : L("Deletes everything in \(bin.detail). Apps can rebuild caches and logs.",
-               "Verwijdert alles in \(bin.detail). Apps kunnen caches en logs opnieuw maken.")
-        alert.addButton(withTitle: L("Clear", "Leeg"))
+        alert.messageText = L("Clean up \(Scanner.formatBytes(total))?", "\(Scanner.formatBytes(total)) opschonen?")
+        alert.informativeText = lines.joined(separator: "\n")
+        alert.addButton(withTitle: L("Clean", "Opschonen"))
         alert.addButton(withTitle: L("Cancel", "Annuleer"))
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+
         DispatchQueue.global(qos: .utility).async {
-            Junk.empty(bin)
+            let outcome = DevClean.clean(items)
             DispatchQueue.main.async {
-                self.scanJunk(force: true)
+                let done = NSAlert()
+                var text: [String] = []
+                if outcome.trashed > 0 {
+                    text.append(L("Moved \(Scanner.formatBytes(outcome.trashed)) to the Trash. Empty the Trash to free the space.",
+                                  "\(Scanner.formatBytes(outcome.trashed)) naar de prullenmand verplaatst. Leeg de prullenmand om de ruimte vrij te maken."))
+                }
+                if outcome.deleted > 0 {
+                    text.append(L("Removed \(Scanner.formatBytes(outcome.deleted)) permanently.",
+                                  "\(Scanner.formatBytes(outcome.deleted)) definitief verwijderd."))
+                }
+                if !outcome.failed.isEmpty {
+                    text.append(L("Could not clean: \(outcome.failed.joined(separator: ", ")). Something may still be using it, or macOS needs Full Disk Access.",
+                                  "Niet gelukt: \(outcome.failed.joined(separator: ", ")). Misschien is het nog in gebruik, of heeft macOS volledige schijftoegang nodig."))
+                }
+                done.messageText = outcome.failed.isEmpty ? L("Cleaned up", "Opgeschoond") : L("Partly cleaned up", "Deels opgeschoond")
+                done.informativeText = text.joined(separator: "\n\n")
+                done.addButton(withTitle: L("Done", "Klaar"))
+                if outcome.trashed > 0 { done.addButton(withTitle: L("Show Trash", "Toon prullenmand")) }
+                NSApp.activate(ignoringOtherApps: true)
+                if done.runModal() == .alertSecondButtonReturn {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/.Trash"))
+                }
+                finished(outcome.cleaned)
             }
         }
     }
