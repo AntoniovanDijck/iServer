@@ -5,7 +5,7 @@
 <h1 align="center">iServer</h1>
 
 <p align="center">
-  <strong>Every dev server running on your Mac, one click away in the menu bar.</strong>
+  <strong>Every dev server running on your Mac, plus CPU, storage and clipboard, one click away in the menu bar.</strong>
 </p>
 
 <p align="center">
@@ -22,22 +22,35 @@
 
 ---
 
-`next dev` in one tab, a Vite server you forgot about, a Postgres from last week, a `python -m http.server` an AI agent started somewhere… **iServer** puts them all in your menu bar, named after their project, with one click to open, reveal or stop them.
+`next dev` in one tab, a Vite server you forgot about, a Postgres from last week, a `python -m http.server` an AI agent started somewhere… **iServer** puts them all in your menu bar, named after their project, with one click to open, reveal or stop them. Next to that it shows how busy your Mac is, what is filling your disk, and what you copied recently.
 
 ## Features
 
+### Servers
+
 - 🔎 **Finds every local server**: any process listening on a TCP port, named after the project folder it runs in
+- 🏷️ **Recognises the stack**: Next.js, Vite, Astro, Nuxt, Remix, Storybook, Django, FastAPI, Flask, Rails, Jupyter, Postgres, MySQL, MongoDB, Redis, Docker, Ollama and plain Node, Bun, Deno or Python each get their own badge
 - 🧩 **Groups related processes**: Electron + its Vite server, or Node + an embedded Postgres, show up as one project
+- 📈 **Live load per server**: CPU sparkline, memory and uptime on every card
 - 🟠 **Flags exposed servers**: orange means it listens on all interfaces and is reachable from your network
-- 🌐 **Open in the browser**: via `localhost`, or via your LAN IP for exposed servers
-- 📂 **Jump to the project** in Finder or a new Terminal window
-- 🛑 **Stop a server** with SIGTERM (after confirming)
+- 🌐 **Open in the browser**: click a card for `localhost`, or the **LAN** button to open it via your network IP
+- 📂 **Jump to the project** in Finder or a new Terminal window (hover a card)
+- 🛑 **Stop a server** with SIGTERM, after confirming; iServer checks each process again first, so a reused PID can't hit something else
 - 🤖 **Knows AI agents**: servers started from a Claude Code scratchpad are labelled with their project
-- 🏷️ **Recognises the stack**: Next.js, Vite, Astro, Django, FastAPI, Rails, Postgres, Redis, Docker and more get their own badge
-- 📈 **Activity**: live CPU, GPU and memory gauges, a history chart and the busiest servers, plus a mini CPU graph in the menu bar
-- 💾 **Storage**: free space per volume, and one-click cleanup of caches, Homebrew, Xcode DerivedData, logs and the Trash (always asks first)
-- 📋 **Clipboard history**: search and re-copy recent clips; items from password managers are skipped and only pinned clips are saved to disk
+
+### Your Mac
+
+- 📊 **Summary bar**: number of dev servers, plus CPU, RAM and disk gauges that turn orange and red as they fill up
+- ⚡ **Activity**: large CPU, GPU and memory gauges, a history chart, and the servers using the most CPU
+- 💾 **Storage**: used and free space per volume, and cleanup of caches, Homebrew, Xcode DerivedData, logs and the Trash. It always asks first, and never touches temp files of running apps or Apple/iCloud caches
+- 📋 **Clipboard history**: search (just start typing) and re-copy recent text, links and files, and pin what you want to keep. Anything a password manager marks as private is skipped, and only pinned clips are saved to disk
+- 🖥️ **Menu bar graph**: the icon is a live mini CPU graph
+
+### Small and native
+
 - 🪶 **Tiny**: one Swift file, no dependencies, no permissions needed
+- ✨ **Feels like macOS**: Liquid Glass on macOS 26, smooth animations, light and dark mode, English and Dutch
+- 🔋 **Light on battery**: scans every 30 seconds (every 8 while open), and animations only run while something moves
 
 ## Install
 
@@ -73,6 +86,7 @@ Click the CPU graph in the menu bar to open the panel. The top bar shows how man
 | Click a card | Open the server in your browser; hover for Finder, Terminal and Stop |
 | **Apps** | Also list regular apps that open ports (Chrome, Spotify, AirPlay…) |
 | **Login** | Start iServer automatically |
+| <kbd>Esc</kbd> | Clear the clipboard search, or close the panel |
 
 It also works from the command line:
 
