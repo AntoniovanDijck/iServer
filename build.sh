@@ -6,7 +6,8 @@ cd "$(dirname "$0")"
 APP=build/iServer.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -o "$APP/Contents/MacOS/iServer" Sources/main.swift -framework AppKit -framework ServiceManagement
+# Target the minimum macOS from Info.plist so the compiler flags APIs that need a newer system.
+swiftc -O -target "$(uname -m)-apple-macos13.0" -o "$APP/Contents/MacOS/iServer" Sources/main.swift -framework AppKit -framework ServiceManagement -framework IOKit
 cp Info.plist "$APP/Contents/"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"

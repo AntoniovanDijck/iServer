@@ -1,6 +1,7 @@
 // iServer — a menu bar app that shows which development servers are running on your Mac.
 import AppKit
 import Darwin
+import IOKit
 import ServiceManagement
 
 // MARK: - Localization (English, with Dutch when that is the preferred language)
@@ -22,6 +23,8 @@ struct ServerProcess {
     let args: String
     var cwd: String
     let elapsed: String
+    var cpu: Double
+    var rss: UInt64
     var listeners: [Listener]
 
     var execName: String { (execPath as NSString).lastPathComponent }
@@ -36,6 +39,8 @@ struct ServerGroup {
     let listeners: [Listener]
 
     var exposed: Bool { listeners.contains { $0.exposed } }
+    var cpu: Double { processes.reduce(0) { $0 + $1.cpu } }
+    var rss: UInt64 { processes.reduce(0) { $0 + $1.rss } }
 
     // Used to decide whether the menu needs to be rebuilt.
     var signature: String {
@@ -110,12 +115,16 @@ enum Scanner {
         var parent: [Int32: Int32] = [:]
         var argsByPid: [Int32: String] = [:]
         var elapsedByPid: [Int32: String] = [:]
-        for line in run("/bin/ps", ["-axww", "-o", "pid=,ppid=,etime=,args="]).split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            guard parts.count >= 3, let pid = Int32(parts[0]), let ppid = Int32(parts[1]) else { continue }
+        var cpuByPid: [Int32: Double] = [:]
+        var rssByPid: [Int32: UInt64] = [:]
+        for line in run("/bin/ps", ["-axww", "-o", "pid=,ppid=,etime=,%cpu=,rss=,args="]).split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
+            guard parts.count >= 5, let pid = Int32(parts[0]), let ppid = Int32(parts[1]) else { continue }
             parent[pid] = ppid
             elapsedByPid[pid] = String(parts[2])
-            argsByPid[pid] = parts.count > 3 ? String(parts[3]) : ""
+            cpuByPid[pid] = Double(parts[3]) ?? 0
+            rssByPid[pid] = (UInt64(parts[4]) ?? 0) * 1024
+            argsByPid[pid] = parts.count > 5 ? String(parts[5]) : ""
         }
 
         // 3. Skip regular apps and system processes
@@ -125,7 +134,7 @@ enum Scanner {
             if !includeApps && isAppOrSystem(path) { continue }
             procs[pid] = ServerProcess(
                 pid: pid, ppid: parent[pid] ?? 0, execPath: path, args: argsByPid[pid] ?? "", cwd: "",
-                elapsed: elapsedByPid[pid] ?? "",
+                elapsed: elapsedByPid[pid] ?? "", cpu: cpuByPid[pid] ?? 0, rss: rssByPid[pid] ?? 0,
                 listeners: ports.map { Listener(port: $0.key, exposed: $0.value) }.sorted { $0.port < $1.port })
         }
         if procs.isEmpty { return [] }
@@ -252,42 +261,2277 @@ enum Scanner {
         if h > 0 { return "\(h)\(hour) \(m)m" }
         return m > 0 ? "\(m)m" : "<1m"
     }
+
+    static func formatCPU(_ value: Double) -> String {
+        value >= 10 ? String(format: "%.0f%%", value) : String(format: "%.1f%%", value)
+    }
+
+    static func formatBytes(_ bytes: UInt64) -> String {
+        let mb = Double(bytes) / 1_048_576
+        if mb >= 1024 { return String(format: "%.1fG", mb / 1024) }
+        if mb >= 10 { return String(format: "%.0fM", mb) }
+        if mb >= 1 { return String(format: "%.1fM", mb) }
+        return String(format: "%.0fK", Double(bytes) / 1024)
+    }
+
+    static func bar(_ fraction: Double, slots: Int = 8) -> String {
+        let filled = min(slots, max(0, Int((min(1, max(0, fraction)) * Double(slots)).rounded())))
+        return "[" + String(repeating: "#", count: filled) + String(repeating: "-", count: slots - filled) + "]"
+    }
+}
+
+struct Vitals {
+    var cpu: Double
+    var gpu: Double
+    var used: UInt64
+    var total: UInt64
+
+    static let empty = Vitals(cpu: 0, gpu: 0, used: 0, total: ProcessInfo.processInfo.physicalMemory)
+    // Sampling happens from several background queues; the tick baseline is shared, so guard it.
+    private static let lock = NSLock()
+    private static var previousTicks: (UInt32, UInt32, UInt32, UInt32)?
+
+    private static func cpuTicks() -> (UInt32, UInt32, UInt32, UInt32)? {
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let result: kern_return_t = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        let t = info.cpu_ticks
+        return (t.0, t.1, t.2, t.3)
+    }
+
+    static func cpuLoad() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        if previousTicks == nil {
+            previousTicks = cpuTicks()
+            usleep(200_000)
+        }
+        guard let previous = previousTicks, let now = cpuTicks() else { return 0 }
+        previousTicks = now
+        let user = Double(now.0 &- previous.0)
+        let system = Double(now.1 &- previous.1)
+        let idle = Double(now.2 &- previous.2)
+        let nice = Double(now.3 &- previous.3)
+        let total = user + system + idle + nice
+        return total > 0 ? (user + system + nice) / total * 100 : 0
+    }
+
+    static func sample() -> Vitals {
+        let cpu = cpuLoad()
+
+        var vm = vm_statistics64()
+        var vmCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let memResult: kern_return_t = withUnsafeMutablePointer(to: &vm) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &vmCount)
+            }
+        }
+        let total = ProcessInfo.processInfo.physicalMemory
+        var used: UInt64 = 0
+        if memResult == KERN_SUCCESS {
+            let pages = UInt64(vm.active_count) + UInt64(vm.wire_count) + UInt64(vm.compressor_page_count)
+            used = min(total, pages * UInt64(vm_kernel_page_size))
+        }
+        return Vitals(cpu: cpu, gpu: gpuUtilization(), used: used, total: total)
+    }
+
+    // Device Utilization % from the GPU accelerator. Same figure Activity Monitor shows.
+    private static func gpuUtilization() -> Double {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else { return 0 }
+        defer { IOObjectRelease(iterator) }
+        var peak = 0.0
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            var raw: Unmanaged<CFMutableDictionary>?
+            guard IORegistryEntryCreateCFProperties(service, &raw, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+                  let props = raw?.takeRetainedValue() as? [String: Any],
+                  let stats = props["PerformanceStatistics"] as? [String: Any] else { continue }
+            peak = max(peak, percent(stats["Device Utilization %"]), percent(stats["Renderer Utilization %"]))
+        }
+        return min(100, peak)
+    }
+
+    static func fraction(of vitals: Vitals) -> (cpu: Double, gpu: Double, mem: Double) {
+        let mem = vitals.total > 0 ? Double(vitals.used) / Double(vitals.total) : 0
+        return (min(1, vitals.cpu / 100), min(1, vitals.gpu / 100), min(1, mem))
+    }
+
+    private static func percent(_ value: Any?) -> Double {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let number = value as? Double { return number }
+        if let number = value as? Int { return Double(number) }
+        return 0
+    }
+}
+
+struct Trace {
+    var cpu: [Double] = []
+    var gpu: [Double] = []
+    var mem: [Double] = []
+    static let capacity = 48
+
+    mutating func push(_ sample: (cpu: Double, gpu: Double, mem: Double)) {
+        cpu.append(min(1, max(0, sample.cpu)))
+        gpu.append(min(1, max(0, sample.gpu)))
+        mem.append(min(1, max(0, sample.mem)))
+        if cpu.count > Trace.capacity {
+            cpu.removeFirst(cpu.count - Trace.capacity)
+            gpu.removeFirst(gpu.count - Trace.capacity)
+            mem.removeFirst(mem.count - Trace.capacity)
+        }
+    }
+}
+
+struct DiskVolume {
+    var name: String
+    var used: UInt64
+    var total: UInt64
+
+    var free: UInt64 { total > used ? total - used : 0 }
+    var fraction: Double { total > 0 ? Double(used) / Double(total) : 0 }
+}
+
+enum Disks {
+    static func mounted() -> [DiskVolume] {
+        let keys: Set<URLResourceKey> = [
+            .volumeNameKey, .volumeTotalCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey, .volumeIsBrowsableKey,
+        ]
+        let urls = FileManager.default.mountedVolumeURLs(
+            includingResourceValuesForKeys: Array(keys), options: [.skipHiddenVolumes]) ?? []
+        var listed: [(String, DiskVolume)] = []
+        for url in urls {
+            guard let values = try? url.resourceValues(forKeys: keys), values.volumeIsBrowsable != false else { continue }
+            let total = UInt64(max(0, values.volumeTotalCapacity ?? 0))
+            guard total > 0 else { continue }
+            let free = UInt64(max(0, values.volumeAvailableCapacityForImportantUsage ?? Int64(total)))
+            let used = total > free ? total - free : 0
+            var name = values.volumeName ?? ""
+            if name.isEmpty { name = url.path == "/" ? "Macintosh HD" : url.lastPathComponent }
+            listed.append((url.path, DiskVolume(name: name, used: used, total: total)))
+        }
+        return listed.sorted { lhs, rhs in
+            if lhs.0 == "/" { return true }
+            if rhs.0 == "/" { return false }
+            return lhs.1.name.localizedCaseInsensitiveCompare(rhs.1.name) == .orderedAscending
+        }.map(\.1)
+    }
+}
+
+struct CleanBin {
+    var id: String
+    var title: String
+    var detail: String
+    var path: String
+    var bytes: UInt64
+    var skip: [String]
+}
+
+enum Junk {
+    static func scan() -> [CleanBin] {
+        let home = NSHomeDirectory()
+        // No $TMPDIR bin: running apps keep live sockets and in-progress files there.
+        // ~/Library/Caches skips Homebrew (its own bin) and Apple's caches (iCloud, CloudKit, system services).
+        let specs: [(String, String, String, String, [String])] = [
+            ("caches", L("caches", "caches"), "~/Library/Caches", "\(home)/Library/Caches", ["Homebrew", "CloudKit", "com.apple.*"]),
+            ("homebrew", "homebrew", "~/Library/Caches/Homebrew", "\(home)/Library/Caches/Homebrew", []),
+            ("xcode", "xcode", "DerivedData", "\(home)/Library/Developer/Xcode/DerivedData", []),
+            ("logs", L("logs", "logs"), "~/Library/Logs", "\(home)/Library/Logs", []),
+            ("trash", L("trash", "prullenmand"), "~/.Trash", "\(home)/.Trash", []),
+        ]
+        return specs.map { id, title, detail, path, skip in
+            CleanBin(id: id, title: title, detail: detail, path: path, bytes: bytes(at: path, skipping: skip), skip: skip)
+        }
+    }
+
+    // Top-level entries that are left alone. Patterns ending in "*" match a prefix.
+    static func isSkipped(_ name: String, _ skip: [String]) -> Bool {
+        skip.contains { $0.hasSuffix("*") ? name.hasPrefix(String($0.dropLast())) : name == $0 }
+    }
+
+    static func empty(_ bin: CleanBin) {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: bin.path, isDirectory: true)
+        guard let items = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for item in items where !isSkipped(item.lastPathComponent, bin.skip) {
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    // Counts exactly what empty() removes, hidden files included.
+    private static func bytes(at path: String, skipping skip: [String]) -> UInt64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return 0 }
+        let root = URL(fileURLWithPath: path, isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: []) else { return 0 }
+        var total: UInt64 = 0
+        for case let url as URL in enumerator {
+            if enumerator.level == 1, isSkipped(url.lastPathComponent, skip) {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            total += UInt64(values.fileSize ?? 0)
+        }
+        return total
+    }
+}
+
+struct ClipItem: Codable, Equatable {
+    var id: UUID
+    var text: String
+    var kind: String
+    var app: String
+    var date: Date
+    var pinned: Bool
+}
+
+final class ClipBook {
+    private(set) var items: [ClipItem] = []
+    var onChange: () -> Void = {}
+    private var suppressChange = -1
+    private var seenChange = NSPasteboard.general.changeCount
+    private var sourceApp = ""
+    private let file: URL
+
+    init() {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("iServer", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        file = dir.appendingPathComponent("clips.json")
+        if let data = try? Data(contentsOf: file),
+           let saved = try? JSONDecoder().decode([ClipItem].self, from: data) {
+            items = saved.filter(\.pinned)
+            if items.count != saved.count { store() }  // scrub unpinned history written by older versions
+        }
+        noteFrontmost()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(appActivated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+    }
+
+    func poll() {
+        let board = NSPasteboard.general
+        let change = board.changeCount
+        guard change != seenChange else { return }
+        noteFrontmost()
+        seenChange = change
+        guard change != suppressChange else { return }
+        // Skip what password managers and other apps mark as private (nspasteboard.org conventions).
+        let privateTypes = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType",
+                            "org.nspasteboard.AutoGeneratedType", "com.agilebits.onepassword"]
+        if let types = board.types, types.contains(where: { privateTypes.contains($0.rawValue) }) { return }
+        if let raw = board.string(forType: .fileURL), let path = URL(string: raw)?.path, !path.isEmpty {
+            remember(path, kind: "file")
+            return
+        }
+        guard let text = board.string(forType: .string) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 50_000 else { return }
+        let kind = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")) ? "link" : "text"
+        remember(String(trimmed.prefix(50_000)), kind: kind)
+    }
+
+    func copy(_ item: ClipItem) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        if item.kind == "file" {
+            board.writeObjects([URL(fileURLWithPath: item.text) as NSURL])
+        } else {
+            board.setString(item.text, forType: .string)
+        }
+        suppressChange = board.changeCount
+        seenChange = board.changeCount
+    }
+
+    func copyString(_ text: String) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+        suppressChange = board.changeCount
+        seenChange = board.changeCount
+    }
+
+    func togglePin(_ id: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].pinned.toggle()
+        items.sort { lhs, rhs in
+            if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
+            return lhs.date > rhs.date
+        }
+        store()
+        onChange()
+    }
+
+    private func remember(_ text: String, kind: String) {
+        if items.contains(where: { $0.text == text && $0.pinned }) { return }
+        items.removeAll { $0.text == text && !$0.pinned }
+        let clip = ClipItem(id: UUID(), text: text, kind: kind, app: sourceApp, date: Date(), pinned: false)
+        let pinCount = items.filter(\.pinned).count
+        items.insert(clip, at: min(pinCount, items.count))
+        var loose = items.filter { !$0.pinned }
+        if loose.count > 40 { loose = Array(loose.prefix(40)) }
+        items = items.filter(\.pinned) + loose
+        store()
+        onChange()
+    }
+
+    // Only pinned clips go to disk; the rest of the history lives in memory, so copied secrets
+    // are not left behind in a plaintext file.
+    private func store() {
+        guard let data = try? JSONEncoder().encode(items.filter(\.pinned)) else { return }
+        try? data.write(to: file, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    @objc private func appActivated(_ note: Notification) {
+        noteFrontmost()
+    }
+
+    private func noteFrontmost() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        sourceApp = app.localizedName ?? ""
+    }
 }
 
 // MARK: - Demo data (`--demo`), for screenshots and trying the UI
 
 enum Demo {
     static func groups() -> [ServerGroup] {
-        func proc(_ pid: Int32, _ exec: String, _ cwd: String, _ elapsed: String, _ ports: [(Int, Bool)], args: String = "") -> ServerProcess {
+        func proc(_ pid: Int32, _ exec: String, _ cwd: String, _ elapsed: String, _ ports: [(Int, Bool)], cpu: Double, rssMB: Double, args: String = "") -> ServerProcess {
             ServerProcess(pid: pid, ppid: 1, execPath: exec, args: args, cwd: cwd, elapsed: elapsed,
+                          cpu: cpu * Double.random(in: 0.4...1.7), rss: UInt64(rssMB * 1_048_576),
                           listeners: ports.map { Listener(port: $0.0, exposed: $0.1) })
         }
         let h = Scanner.home
         let node = "/opt/homebrew/bin/node"
         let groups: [[ServerProcess]] = [
-            [proc(41210, node, "\(h)/Projects/acme-web", "02:14:09", [(3000, true)])],
-            [proc(41388, node, "\(h)/Projects/acme-api", "01:52:33", [(8080, false), (9229, false)])],
-            [proc(40112, node, "\(h)/Projects/design-system", "1-03:12:00", [(6006, false)])],
-            [proc(43007, node, "\(h)/Projects/docs", "18:40", [(5173, false)])],
+            [
+                proc(41210, node, "\(h)/Projects/acme-web", "02:14:09", [(3000, true)], cpu: 6.4, rssMB: 240),
+                proc(41211, node, "\(h)/Projects/acme-web", "02:14:08", [], cpu: 1.2, rssMB: 64),
+            ],
+            [proc(41388, node, "\(h)/Projects/acme-api", "01:52:33", [(8080, false), (9229, false)], cpu: 2.8, rssMB: 160)],
+            [proc(40112, node, "\(h)/Projects/design-system", "1-03:12:00", [(6006, false)], cpu: 0.6, rssMB: 90)],
+            [proc(43007, node, "\(h)/Projects/docs", "18:40", [(5173, false)], cpu: 0.4, rssMB: 48)],
             [proc(44120, "/usr/bin/python3", "/private/tmp/claude-501/\(h.replacingOccurrences(of: "/", with: "-"))-Projects-landing-page/3f2a/scratchpad/site",
-                  "04:02", [(8000, false)])],
-            [proc(912, "/opt/homebrew/opt/postgresql@17/bin/postgres", "/opt/homebrew/var/postgresql@17", "6-04:10:00", [(5432, false)])],
-            [proc(918, "/opt/homebrew/opt/redis/bin/redis-server", "/opt/homebrew/var/db/redis", "6-04:10:02", [(6379, false)])],
+                  "04:02", [(8000, false)], cpu: 1.1, rssMB: 32)],
+            [proc(912, "/opt/homebrew/opt/postgresql@17/bin/postgres", "/opt/homebrew/var/postgresql@17", "6-04:10:00", [(5432, false)], cpu: 0.3, rssMB: 86)],
+            [proc(918, "/opt/homebrew/opt/redis/bin/redis-server", "/opt/homebrew/var/db/redis", "6-04:10:02", [(6379, false)], cpu: 0.2, rssMB: 8)],
         ]
         return Scanner.sorted(groups.map { Scanner.makeGroup(root: $0[0], members: $0) })
     }
 }
 
+// MARK: - Palette
+
+enum Term {
+    static var ink: NSColor { .labelColor }
+    static var dim: NSColor { .secondaryLabelColor }
+    static var faint: NSColor { .tertiaryLabelColor }
+    static var line: NSColor { .separatorColor }
+    static var fill: NSColor { .labelColor.withAlphaComponent(0.06) }
+    static var fillHot: NSColor { .labelColor.withAlphaComponent(0.11) }
+    static var stroke: NSColor { .labelColor.withAlphaComponent(0.07) }
+    static var accent: NSColor { .controlAccentColor }
+    static var cpu: NSColor { .systemBlue }
+    static var gpu: NSColor { .systemTeal }
+    static var mem: NSColor { .systemPurple }
+    static var disk: NSColor { .systemGreen }
+    static var lan: NSColor { .systemOrange }
+    static var bins: [NSColor] { [.systemBlue, .systemBrown, .systemTeal, .systemPurple, .systemPink, .systemGreen] }
+}
+
+func termFont(_ size: CGFloat, _ weight: NSFont.Weight = .medium) -> NSFont {
+    NSFont.systemFont(ofSize: size, weight: weight)
+}
+
+// SF Rounded, used for the big numbers.
+func roundedFont(_ size: CGFloat, _ weight: NSFont.Weight = .semibold) -> NSFont {
+    let base = NSFont.systemFont(ofSize: size, weight: weight)
+    guard let descriptor = base.fontDescriptor.withDesign(.rounded) else { return base }
+    return NSFont(descriptor: descriptor, size: size) ?? base
+}
+
+func digitFont(_ size: CGFloat, _ weight: NSFont.Weight = .medium) -> NSFont {
+    NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
+}
+
+func glassSymbol(_ name: String, pointSize: CGFloat, weight: NSFont.Weight = .medium, color: NSColor) -> NSImage? {
+    let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+    return NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+}
+
+func drawSymbol(_ name: String, in rect: NSRect, pointSize: CGFloat, weight: NSFont.Weight = .medium, color: NSColor) {
+    guard let image = glassSymbol(name, pointSize: pointSize, weight: weight, color: color) else { return }
+    let size = image.size
+    let target = NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height)
+    image.draw(in: target, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+}
+
+// MARK: - Server kinds (framework / runtime badge)
+
+struct Kind {
+    let label: String
+    let mono: String
+    let symbol: String?
+    let color: NSColor
+
+    init(_ label: String, _ mono: String, _ color: NSColor, symbol: String? = nil) {
+        self.label = label
+        self.mono = mono
+        self.color = color
+        self.symbol = symbol
+    }
+
+    // Matched against the executable path and arguments of every process in the group.
+    static let rules: [([String], Kind)] = [
+        (["next dev", "next start", "next-server", "/next/dist"], Kind("Next.js", "N", .systemGray)),
+        (["vite"], Kind("Vite", "V", .systemPurple)),
+        (["astro"], Kind("Astro", "A", .systemOrange)),
+        (["nuxt"], Kind("Nuxt", "Nu", .systemGreen)),
+        (["remix"], Kind("Remix", "R", .systemBlue)),
+        (["storybook"], Kind("Storybook", "Sb", .systemPink)),
+        (["webpack"], Kind("Webpack", "W", .systemBlue)),
+        (["expo start", "/expo/", "metro"], Kind("Expo", "Ex", .systemIndigo)),
+        (["jupyter"], Kind("Jupyter", "Ju", .systemOrange)),
+        (["uvicorn", "fastapi"], Kind("FastAPI", "Fa", .systemTeal)),
+        (["manage.py", "django"], Kind("Django", "Dj", .systemGreen)),
+        (["flask"], Kind("Flask", "Fl", .systemGray)),
+        (["rails", "puma"], Kind("Rails", "Rb", .systemRed)),
+        (["postgres"], Kind("PostgreSQL", "", .systemBlue, symbol: "cylinder.split.1x2.fill")),
+        (["mysqld", "mariadbd"], Kind("MySQL", "", .systemOrange, symbol: "cylinder.split.1x2.fill")),
+        (["mongod"], Kind("MongoDB", "", .systemGreen, symbol: "cylinder.split.1x2.fill")),
+        (["redis-server", "valkey"], Kind("Redis", "", .systemRed, symbol: "bolt.fill")),
+        (["docker", "orbstack"], Kind("Docker", "", .systemBlue, symbol: "shippingbox.fill")),
+        (["ollama"], Kind("Ollama", "", .systemGray, symbol: "brain.head.profile")),
+        (["claude"], Kind("Claude", "", .systemOrange, symbol: "sparkle")),
+    ]
+
+    // Fallback on the executable name.
+    static let runtimes: [(String, Kind)] = [
+        ("node", Kind("Node.js", "JS", .systemGreen)),
+        ("bun", Kind("Bun", "Bn", .systemBrown)),
+        ("deno", Kind("Deno", "De", .systemGray)),
+        ("python", Kind("Python", "Py", .systemBlue)),
+        ("ruby", Kind("Ruby", "Rb", .systemRed)),
+        ("java", Kind("Java", "Jv", .systemOrange)),
+        ("php", Kind("PHP", "P", .systemIndigo)),
+    ]
+
+    static func of(_ group: ServerGroup) -> Kind {
+        let text = group.processes.map { ($0.execPath + " " + $0.args).lowercased() }.joined(separator: " ")
+        for (keys, kind) in rules where keys.contains(where: text.contains) { return kind }
+        let execs = group.processes.map { $0.execName.lowercased() }
+        for (prefix, kind) in runtimes where execs.contains(where: { $0.hasPrefix(prefix) }) { return kind }
+        return Kind(L("Server", "Server"), "", .systemGray, symbol: "server.rack")
+    }
+}
+
+// MARK: - Drawing helpers
+
+enum Draw {
+    static func card(_ rect: NSRect, hot: Bool = false, radius: CGFloat = 14) {
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+        (hot ? Term.fillHot : Term.fill).setFill()
+        path.fill()
+        Term.stroke.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    static func text(_ string: String, font: NSFont, color: NSColor, centeredAt point: NSPoint) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let size = (string as NSString).size(withAttributes: attrs)
+        (string as NSString).draw(at: NSPoint(x: point.x - size.width / 2, y: point.y - size.height / 2), withAttributes: attrs)
+    }
+
+    @discardableResult
+    static func text(_ string: String, font: NSFont, color: NSColor, at point: NSPoint) -> CGFloat {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        (string as NSString).draw(at: point, withAttributes: attrs)
+        return (string as NSString).size(withAttributes: attrs).width
+    }
+
+    static func width(_ string: String, font: NSFont) -> CGFloat {
+        ceil((string as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    // Warmer colour as a gauge fills up.
+    static func level(_ fraction: Double, _ tint: NSColor) -> NSColor {
+        if fraction >= 0.9 { return .systemRed }
+        if fraction >= 0.75 { return .systemOrange }
+        return tint
+    }
+
+    // Draw only in non-flipped views: the arc runs clockwise from 12 o'clock.
+    static func ring(center: NSPoint, radius: CGFloat, width: CGFloat, fraction: Double, tint: NSColor) {
+        let track = NSBezierPath()
+        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
+        track.lineWidth = width
+        NSColor.labelColor.withAlphaComponent(0.09).setStroke()
+        track.stroke()
+        let f = min(1, max(0, fraction))
+        guard f > 0.004 else { return }
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: center, radius: radius, startAngle: 90, endAngle: 90 - 360 * CGFloat(f), clockwise: true)
+        arc.lineWidth = width
+        arc.lineCapStyle = .round
+        tint.setStroke()
+        arc.stroke()
+    }
+
+    static func smooth(_ points: [NSPoint]) -> NSBezierPath {
+        let path = NSBezierPath()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        guard points.count > 1 else { return path }
+        for i in 1..<points.count {
+            let p0 = points[max(i - 2, 0)], p1 = points[i - 1], p2 = points[i], p3 = points[min(i + 1, points.count - 1)]
+            // Control points stay within the segment's vertical range, so the curve never overshoots.
+            let low = min(p1.y, p2.y), high = max(p1.y, p2.y)
+            let c1 = NSPoint(x: p1.x + (p2.x - p0.x) / 6, y: min(high, max(low, p1.y + (p2.y - p0.y) / 6)))
+            let c2 = NSPoint(x: p2.x - (p3.x - p1.x) / 6, y: min(high, max(low, p2.y - (p3.y - p1.y) / 6)))
+            path.curve(to: p2, controlPoint1: c1, controlPoint2: c2)
+        }
+        return path
+    }
+
+    // Samples are 0...1. With a capacity the line is right-aligned, so it grows in from the right.
+    // Draw only in non-flipped views.
+    static func spark(_ samples: [Double], in rect: NSRect, tint: NSColor, lineWidth: CGFloat = 1.5, fill: Bool = true, capacity: Int? = nil) {
+        guard samples.count > 1 else {
+            let base = NSBezierPath()
+            base.move(to: NSPoint(x: rect.minX, y: rect.minY + 1))
+            base.line(to: NSPoint(x: rect.maxX, y: rect.minY + 1))
+            base.lineWidth = 1
+            tint.withAlphaComponent(0.35).setStroke()
+            base.stroke()
+            return
+        }
+        let slots = max(capacity ?? samples.count, samples.count)
+        let step = rect.width / CGFloat(max(slots - 1, 1))
+        let offset = CGFloat(slots - samples.count) * step
+        let points = samples.enumerated().map { index, value in
+            NSPoint(x: rect.minX + offset + CGFloat(index) * step,
+                    y: rect.minY + CGFloat(min(1, max(0, value))) * rect.height)
+        }
+        let line = smooth(points)
+        if fill, let first = points.first, let last = points.last {
+            let area = line.copy() as! NSBezierPath
+            area.line(to: NSPoint(x: last.x, y: rect.minY))
+            area.line(to: NSPoint(x: first.x, y: rect.minY))
+            area.close()
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: rect.insetBy(dx: -2, dy: 0)).addClip()
+            NSGradient(starting: tint.withAlphaComponent(0.0), ending: tint.withAlphaComponent(0.32))?.draw(in: area, angle: 90)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        tint.setStroke()
+        line.lineWidth = lineWidth
+        line.lineCapStyle = .round
+        line.lineJoinStyle = .round
+        line.stroke()
+    }
+
+    // Rounded tile with a monogram or symbol. Draw only in non-flipped views.
+    static func monogram(_ kind: Kind, in rect: NSRect) {
+        let radius = rect.width * 0.28
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        let top = kind.color.blended(withFraction: 0.22, of: .white) ?? kind.color
+        NSGradient(starting: top, ending: kind.color)?.draw(in: path, angle: -90)
+        NSColor.white.withAlphaComponent(0.18).setStroke()
+        let rim = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+        rim.lineWidth = 1
+        rim.stroke()
+        if let symbol = kind.symbol {
+            drawSymbol(symbol, in: rect, pointSize: rect.width * 0.42, weight: .semibold, color: .white)
+        } else {
+            text(kind.mono, font: roundedFont(rect.width * (kind.mono.count > 1 ? 0.36 : 0.44), .bold), color: .white,
+                 centeredAt: NSPoint(x: rect.midX, y: rect.midY))
+        }
+    }
+
+    // Small tinted tile with a symbol (storage bins, clipboard kinds).
+    static func tile(_ symbol: String, in rect: NSRect, color: NSColor) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        color.withAlphaComponent(0.16).setFill()
+        path.fill()
+        drawSymbol(symbol, in: rect, pointSize: rect.width * 0.46, weight: .semibold, color: color)
+    }
+}
+
+// MARK: - Animation
+
+// A value that eases toward its target, one step per frame.
+struct Eased {
+    var value: Double
+    var target: Double
+
+    init(_ value: Double) {
+        self.value = value
+        target = value
+    }
+
+    // Returns true while still moving.
+    mutating func step() -> Bool {
+        let delta = target - value
+        if abs(delta) < 0.0015 {
+            value = target
+            return false
+        }
+        value += delta * 0.16
+        return true
+    }
+}
+
+// Runs per-frame steps at about 60 fps, only while something is moving.
+final class Animator {
+    static let shared = Animator()
+    private var timer: Timer?
+    private var steps: [ObjectIdentifier: () -> Bool] = [:]
+
+    // `step` returns true while it still needs frames. One step per owner; a new one replaces the old.
+    func run(_ owner: AnyObject, step: @escaping () -> Bool) {
+        steps[ObjectIdentifier(owner)] = step
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        steps = steps.filter { $0.value() }
+        if steps.isEmpty {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+}
+
+// Eases a list of values and redraws the view until they settle.
+final class EasedValues {
+    private(set) var values: [Eased]
+    private weak var view: NSView?
+
+    init(count: Int, view: NSView) {
+        values = Array(repeating: Eased(0), count: count)
+        self.view = view
+    }
+
+    subscript(index: Int) -> Double { index < values.count ? values[index].value : 0 }
+
+    func set(_ targets: [Double]) {
+        if targets.count != values.count { values = targets.map { _ in Eased(0) } }
+        for index in targets.indices { values[index].target = targets[index] }
+        Animator.shared.run(self) { [weak self] in
+            guard let self, let view = self.view else { return false }
+            var moving = false
+            for index in self.values.indices where self.values[index].step() { moving = true }
+            view.needsDisplay = true
+            return moving
+        }
+    }
+}
+
+// MARK: - Menu bar icon
+
+enum StatusIcon {
+    static let bars = 6
+
+    // Just a small CPU history graph. Drawn lazily so it follows the menu bar's light/dark appearance.
+    static func image(cpu: [Double]) -> NSImage {
+        let barWidth: CGFloat = 2.5, gap: CGFloat = 1.5
+        let size = NSSize(width: CGFloat(bars) * (barWidth + gap) - gap, height: 18)
+        let samples = Array(repeating: 0.0, count: max(0, bars - cpu.count)) + cpu.suffix(bars)
+
+        let image = NSImage(size: size, flipped: false) { _ in
+            let ink = NSColor.labelColor
+            var x: CGFloat = 0
+            for value in samples {
+                let v = min(1, max(0, value))
+                // Faint full-height track, so the graph reads as a graph even when the Mac is idle.
+                let track = NSRect(x: x, y: 2, width: barWidth, height: 14)
+                ink.withAlphaComponent(0.2).setFill()
+                NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
+                let bar = NSRect(x: x, y: 2, width: barWidth, height: max(2, CGFloat(v) * 14))
+                (v >= 0.8 ? NSColor.systemOrange : ink).setFill()
+                NSBezierPath(roundedRect: bar, xRadius: 1, yRadius: 1).fill()
+                x += barWidth + gap
+            }
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = L("CPU load", "CPU-belasting")
+        return image
+    }
+}
+
+// MARK: - Panel metrics
+
+enum Metrics {
+    static let width: CGFloat = 440
+    static let hero: CGFloat = 70
+    static let tabs: CGFloat = 40
+    static var header: CGFloat { hero + tabs }
+    static let footer: CGFloat = 46
+    static let row: CGFloat = 76
+    static let gauges: CGFloat = 128
+    static let history: CGFloat = 124
+    static let proc: CGFloat = 32
+    static let volume: CGFloat = 84
+    static let bin: CGFloat = 46
+    static let clip: CGFloat = 50
+    static let section: CGFloat = 28
+    static let listPad: CGFloat = 4
+    static let empty: CGFloat = 150
+    static let inset: CGFloat = 12
+    static var chrome: CGFloat { header + footer }
+
+    static func activityHeight(count: Int) -> CGFloat {
+        var height = listPad + gauges + history
+        if count > 0 { height += section + CGFloat(count) * proc }
+        return height + listPad * 2
+    }
+
+    static func storageHeight(volumes: Int, bins: Int) -> CGFloat {
+        listPad + CGFloat(max(volumes, 1)) * volume + section + 22 + CGFloat(max(bins, 1)) * bin + listPad * 2
+    }
+
+    static func clipHeight(count: Int) -> CGFloat {
+        46 + CGFloat(max(count, 1)) * clip + listPad * 2
+    }
+
+    static func listHeight(count: Int, maxHeight: CGFloat) -> CGFloat {
+        let natural = count == 0 ? empty : listPad * 2 + CGFloat(count) * row
+        return capped(natural, maxHeight: maxHeight)
+    }
+
+    static func capped(_ natural: CGFloat, maxHeight: CGFloat) -> CGFloat {
+        min(natural, max(empty, maxHeight - chrome - 8))
+    }
+}
+
+func makeLabel(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
+    let field = NSTextField(labelWithString: text)
+    field.font = termFont(size, weight)
+    field.textColor = color
+    field.lineBreakMode = .byTruncatingTail
+    field.maximumNumberOfLines = 1
+    field.cell?.usesSingleLineMode = true
+    field.cell?.lineBreakMode = .byTruncatingTail
+    return field
+}
+
+// MARK: - Controls
+
+class HoverView: NSView {
+    var onClick: () -> Void = {}
+    var hovered = false
+    var pressed = false
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true; refresh() }
+    override func mouseExited(with event: NSEvent) { hovered = false; pressed = false; refresh() }
+    override func mouseDown(with event: NSEvent) { pressed = true; refresh() }
+    override func mouseUp(with event: NSEvent) {
+        let inside = bounds.contains(convert(event.locationInWindow, from: nil))
+        pressed = false
+        hovered = inside
+        refresh()
+        if inside { onClick() }
+    }
+
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+    func refresh() { needsDisplay = true }
+}
+
+// Port pill. Optional symbol and tint (orange for ports reachable from the network).
+final class Chip: HoverView {
+    let title: String
+    let preferredWidth: CGFloat
+    private let symbol: String?
+    private let tint: NSColor?
+    private var confirmed = false
+    private static let font = digitFont(11, .semibold)
+
+    init(title: String, help: String, symbol: String? = nil, tint: NSColor? = nil) {
+        self.title = title
+        self.symbol = symbol
+        self.tint = tint
+        preferredWidth = max(34, Draw.width(title, font: Chip.font) + 16 + (symbol == nil ? 0 : 14))
+        super.init(frame: .zero)
+        toolTip = help
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(help)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func confirm() {
+        confirmed = true
+        needsDisplay = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.confirmed = false
+            self?.needsDisplay = true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        let ink: NSColor
+        if confirmed {
+            Term.accent.setFill()
+            ink = .white
+        } else if let tint {
+            tint.withAlphaComponent(hovered ? 0.3 : 0.18).setFill()
+            ink = tint
+        } else {
+            (hovered ? Term.fillHot : Term.fill).setFill()
+            ink = Term.ink
+        }
+        path.fill()
+        let attrs: [NSAttributedString.Key: Any] = [.font: Chip.font, .foregroundColor: ink]
+        let size = (title as NSString).size(withAttributes: attrs)
+        var x = bounds.midX - (size.width + (symbol == nil ? 0 : 14)) / 2
+        if let symbol {
+            drawSymbol(symbol, in: NSRect(x: x, y: 0, width: 11, height: bounds.height), pointSize: 9, weight: .semibold, color: ink)
+            x += 14
+        }
+        (title as NSString).draw(at: NSPoint(x: x, y: (bounds.height - size.height) / 2), withAttributes: attrs)
+    }
+}
+
+final class IconButton: HoverView {
+    private var symbolName: String
+    private let destructive: Bool
+
+    init(symbol: String, help: String, destructive: Bool = false, action: @escaping () -> Void) {
+        symbolName = symbol
+        self.destructive = destructive
+        super.init(frame: .zero)
+        onClick = action
+        toolTip = help
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(help)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let active = hovered || pressed
+        if active {
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7)
+            (destructive ? NSColor.systemRed.withAlphaComponent(0.18) : Term.fillHot).setFill()
+            path.fill()
+        }
+        let color: NSColor = destructive ? (active ? .systemRed : Term.dim) : (active ? Term.ink : Term.dim)
+        drawSymbol(symbolName, in: bounds, pointSize: 12, color: color)
+    }
+}
+
+final class QuietButton: HoverView {
+    let title: NSTextField
+
+    init(_ text: String, action: @escaping () -> Void) {
+        title = makeLabel(text, size: 12, weight: .semibold, color: Term.ink)
+        title.alignment = .center
+        super.init(frame: .zero)
+        onClick = action
+        addSubview(title)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(text)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        title.sizeToFit()
+        title.frame = NSRect(
+            x: (bounds.width - title.bounds.width) / 2,
+            y: (bounds.height - title.bounds.height) / 2,
+            width: title.bounds.width, height: title.bounds.height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        (hovered ? Term.fillHot : Term.fill).setFill()
+        path.fill()
+    }
+}
+
+// Footer toggle: symbol + caption in a pill, accent-tinted when on.
+final class TogglePill: HoverView {
+    let caption: String
+    let symbol: String
+    var checked = false { didSet { needsDisplay = true } }
+    var onChange: (Bool) -> Void = { _ in }
+    private static let font = termFont(12, .medium)
+
+    var preferredWidth: CGFloat { Draw.width(caption, font: TogglePill.font) + 40 }
+
+    init(_ caption: String, symbol: String, help: String) {
+        self.caption = caption
+        self.symbol = symbol
+        super.init(frame: .zero)
+        toolTip = help
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(help)
+        onClick = { [weak self] in
+            guard let self else { return }
+            self.checked.toggle()
+            self.onChange(self.checked)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        if checked {
+            Term.accent.withAlphaComponent(hovered ? 0.3 : 0.2).setFill()
+        } else {
+            (hovered ? Term.fillHot : Term.fill).setFill()
+        }
+        path.fill()
+        let color: NSColor = checked ? Term.accent : Term.dim
+        drawSymbol(symbol, in: NSRect(x: 9, y: 0, width: 16, height: bounds.height), pointSize: 11, weight: .semibold, color: color)
+        Draw.text(caption, font: TogglePill.font, color: checked ? Term.ink : Term.dim,
+                  at: NSPoint(x: 29, y: (bounds.height - 15) / 2))
+    }
+}
+
+// MARK: - Hero: server count and live system gauges
+
+final class HeroView: NSView {
+    private lazy var eased = EasedValues(count: 3, view: self)
+    private var count = 0
+    private var exposed = 0
+    private var stats: [(caption: String, fraction: Double, value: String, tint: NSColor)] = []
+
+    func set(groups: [ServerGroup], vitals: Vitals, disk: DiskVolume?) {
+        count = groups.count
+        exposed = groups.filter(\.exposed).count
+        let mem = vitals.total > 0 ? Double(vitals.used) / Double(vitals.total) : 0
+        stats = [
+            ("CPU", vitals.cpu / 100, "\(Int(vitals.cpu.rounded()))%", Term.cpu),
+            ("RAM", mem, "\(Int((mem * 100).rounded()))%", Term.mem),
+            (L("Disk", "Schijf"), disk?.fraction ?? 0, disk.map { "\(Int(($0.fraction * 100).rounded()))%" } ?? "–", Term.disk),
+        ]
+        eased.set(stats.map(\.fraction))
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = NSRect(x: Metrics.inset, y: 4, width: bounds.width - Metrics.inset * 2, height: bounds.height - 10)
+        Draw.card(card, radius: 16)
+
+        // Left: big count with a status line
+        let numberFont = roundedFont(30, .bold)
+        let number = "\(count)"
+        let numberWidth = Draw.width(number, font: numberFont)
+        Draw.text(number, font: numberFont, color: count == 0 ? Term.dim : Term.ink,
+                  at: NSPoint(x: card.minX + 16, y: card.midY - 19))
+        let textX = card.minX + 16 + numberWidth + 9
+        let noun = count == 1 ? L("dev server", "dev server") : L("dev servers", "dev servers")
+        Draw.text(noun, font: termFont(13, .semibold), color: Term.ink, at: NSPoint(x: textX, y: card.midY + 1))
+        let status: String
+        let statusColor: NSColor
+        if count == 0 {
+            status = L("nothing running", "niets actief")
+            statusColor = Term.dim
+        } else if exposed > 0 {
+            status = "\(exposed) " + L("on your network", "in je netwerk")
+            statusColor = Term.lan
+        } else {
+            status = L("all local", "alles lokaal")
+            statusColor = .systemGreen
+        }
+        let dot = NSRect(x: textX, y: card.midY - 12, width: 6, height: 6)
+        statusColor.setFill()
+        NSBezierPath(ovalIn: dot).fill()
+        Draw.text(status, font: termFont(11, .medium), color: Term.dim, at: NSPoint(x: textX + 10, y: card.midY - 17))
+
+        // Right: three mini gauges
+        let slot: CGFloat = 76
+        var x = card.maxX - 10 - slot * CGFloat(stats.count)
+        for (index, stat) in stats.enumerated() {
+            let center = NSPoint(x: x + 14, y: card.midY)
+            let shown = eased[index]
+            Draw.ring(center: center, radius: 11, width: 4, fraction: shown, tint: Draw.level(shown, stat.tint))
+            Draw.text(stat.caption, font: termFont(10, .semibold), color: Term.dim, at: NSPoint(x: x + 31, y: card.midY + 1))
+            Draw.text(stat.value, font: roundedFont(13, .semibold), color: Term.ink, at: NSPoint(x: x + 31, y: card.midY - 15))
+            x += slot
+        }
+    }
+}
+
+// MARK: - Server card
+
+final class ServerCard: HoverView {
+    let groupID: Int32
+    private let kind: Kind
+    private let exposed: Bool
+    private let hasPrimary: Bool
+    private let titleLabel: NSTextField
+    private let subtitleLabel: NSTextField
+    private let cpuLabel: NSTextField
+    private let statsLabel: NSTextField
+    private var chips: [Chip] = []
+    private var buttons: [IconButton] = []
+    private var history: [Double]
+
+    init(group: ServerGroup, history: [Double], lan: String?,
+         openURL: @escaping (String) -> Void,
+         copyText: @escaping (String) -> Void,
+         reveal: @escaping (String) -> Void,
+         terminal: @escaping (String) -> Void,
+         stop: @escaping () -> Void) {
+        groupID = group.id
+        kind = Kind.of(group)
+        exposed = group.exposed
+        self.history = history
+        let primary = group.listeners.first { Scanner.isHTTP($0, in: group) }
+        hasPrimary = primary != nil
+
+        titleLabel = makeLabel(group.title, size: 13, weight: .semibold, color: Term.ink)
+        subtitleLabel = makeLabel(kind.label + "  ·  " + group.detail, size: 11, weight: .regular, color: Term.dim)
+        subtitleLabel.lineBreakMode = .byTruncatingMiddle
+        subtitleLabel.cell?.lineBreakMode = .byTruncatingMiddle
+        cpuLabel = makeLabel("", size: 13, weight: .semibold, color: Term.ink)
+        cpuLabel.font = roundedFont(14, .semibold)
+        cpuLabel.alignment = .right
+        statsLabel = makeLabel("", size: 11, weight: .medium, color: Term.dim)
+        statsLabel.font = digitFont(11, .medium)
+        statsLabel.alignment = .right
+
+        super.init(frame: .zero)
+        if let primary {
+            onClick = { openURL("http://localhost:\(primary.port)") }
+        }
+        for view in [titleLabel, subtitleLabel, cpuLabel, statsLabel] { addSubview(view) }
+
+        for listener in group.listeners {
+            let http = Scanner.isHTTP(listener, in: group)
+            let help = http
+                ? L("Open", "Open") + " http://localhost:\(listener.port)"
+                : L("Copy", "Kopieer") + " localhost:\(listener.port)"
+            let chip = Chip(title: ":\(listener.port)", help: help, tint: listener.exposed && http ? Term.lan : nil)
+            chip.onClick = { [weak chip] in
+                if http {
+                    openURL("http://localhost:\(listener.port)")
+                } else {
+                    copyText("localhost:\(listener.port)")
+                    chip?.confirm()
+                }
+            }
+            chips.append(chip)
+        }
+        if let lan, let listener = group.listeners.first(where: { $0.exposed && Scanner.isHTTP($0, in: group) }) {
+            let url = "http://\(lan):\(listener.port)"
+            let chip = Chip(title: "LAN", help: L("Open", "Open") + " " + url, symbol: "wifi", tint: Term.lan)
+            chip.onClick = { openURL(url) }
+            chips.append(chip)
+        }
+        chips.forEach(addSubview)
+
+        if let folder = group.folder {
+            buttons.append(IconButton(symbol: "folder", help: L("Show in Finder", "Toon in Finder")) { reveal(folder) })
+            buttons.append(IconButton(symbol: "terminal", help: L("Open Terminal here", "Open Terminal hier")) { terminal(folder) })
+        }
+        buttons.append(IconButton(symbol: "stop.circle", help: L("Stop server…", "Stop server…"), destructive: true, action: stop))
+        buttons.forEach {
+            $0.isHidden = true
+            addSubview($0)
+        }
+        apply(group)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func applyStats(_ group: ServerGroup, history: [Double]) {
+        self.history = history
+        apply(group)
+        needsDisplay = true
+        needsLayout = true
+    }
+
+    private func apply(_ group: ServerGroup) {
+        cpuLabel.stringValue = Scanner.formatCPU(group.cpu)
+        cpuLabel.textColor = group.cpu >= 40 ? .systemOrange : (group.cpu < 1 ? Term.dim : Term.ink)
+        let root = group.processes.first { $0.pid == group.id } ?? group.processes.first
+        statsLabel.stringValue = "\(Scanner.formatBytes(group.rss))  ·  \(Scanner.formatElapsed(root?.elapsed ?? ""))"
+        toolTip = ServerCard.tip(group, kind: kind)
+    }
+
+    override func refresh() {
+        super.refresh()
+        let showActions = hovered
+        buttons.forEach { $0.isHidden = !showActions }
+        statsLabel.isHidden = showActions
+        needsLayout = true
+    }
+
+    override func resetCursorRects() {
+        if hasPrimary { super.resetCursorRects() }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        for view in (chips as [NSView]) + (buttons as [NSView]) where !view.isHidden && view.frame.contains(local) {
+            return view
+        }
+        return self
+    }
+
+    private var card: NSRect { bounds.insetBy(dx: Metrics.inset, dy: 3) }
+    private var sparkRect: NSRect { NSRect(x: card.maxX - 12 - 54 - 62, y: card.maxY - 27, width: 56, height: 20) }
+
+    override func layout() {
+        super.layout()
+        let card = self.card
+        let left = card.minX + 58
+        let right = card.maxX - 12
+        cpuLabel.frame = NSRect(x: right - 54, y: card.maxY - 27, width: 54, height: 19)
+        titleLabel.frame = NSRect(x: left, y: card.maxY - 26, width: max(40, sparkRect.minX - 8 - left), height: 17)
+        subtitleLabel.frame = NSRect(x: left, y: card.maxY - 43, width: max(40, right - left), height: 14)
+        statsLabel.frame = NSRect(x: right - 130, y: card.minY + 9, width: 130, height: 14)
+
+        var x = right - 24
+        for button in buttons.reversed() {
+            button.frame = NSRect(x: x, y: card.minY + 6, width: 24, height: 20)
+            x -= 26
+        }
+        let statsWidth = Draw.width(statsLabel.stringValue, font: statsLabel.font ?? digitFont(11))
+        let limit = (hovered ? x + 26 : right - statsWidth) - 8
+        var chipX = left
+        for chip in chips {
+            let fits = chipX + chip.preferredWidth <= limit
+            chip.isHidden = !fits
+            guard fits else { continue }
+            chip.frame = NSRect(x: chipX, y: card.minY + 7, width: chip.preferredWidth, height: 18)
+            chipX += chip.preferredWidth + 4
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = self.card
+        Draw.card(card, hot: hovered || pressed)
+        let tile = NSRect(x: card.minX + 12, y: card.midY - 18, width: 36, height: 36)
+        Draw.monogram(kind, in: tile)
+        let dot = NSRect(x: tile.maxX - 8, y: tile.minY - 3, width: 12, height: 12)
+        NSColor.windowBackgroundColor.setFill()
+        NSBezierPath(ovalIn: dot).fill()
+        (exposed ? Term.lan : NSColor.systemGreen).setFill()
+        NSBezierPath(ovalIn: dot.insetBy(dx: 2.5, dy: 2.5)).fill()
+
+        let peak = max(5, history.max() ?? 0)
+        let padded = Array(repeating: history.first ?? 0, count: max(0, 20 - history.count)) + history
+        Draw.spark(padded.map { $0 / peak }, in: sparkRect, tint: exposed ? Term.lan : Term.cpu,
+                   lineWidth: 1.4, fill: true, capacity: 20)
+    }
+
+    private static func tip(_ group: ServerGroup, kind: Kind) -> String {
+        var lines = [kind.label + "  ·  " + group.detail]
+        lines.append("\(Scanner.formatCPU(group.cpu))  \(Scanner.formatBytes(group.rss))")
+        for proc in group.processes.prefix(8) {
+            let ports = proc.listeners.map { ":\($0.port)" }.joined(separator: " ")
+            lines.append("\(proc.execName)  pid \(proc.pid)  \(Scanner.formatCPU(proc.cpu))  \(Scanner.formatBytes(proc.rss))  \(Scanner.formatElapsed(proc.elapsed))  \(ports)")
+        }
+        if group.processes.count > 8 {
+            let rest = group.processes.count - 8
+            lines.append(L("… and \(rest) more processes", "… en nog \(rest) processen"))
+        }
+        lines.append(group.exposed
+            ? L("Reachable from your network", "Bereikbaar via het netwerk")
+            : L("Local only", "Alleen lokaal bereikbaar"))
+        return lines.joined(separator: "\n")
+    }
+}
+
+final class EmptyState: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        let circle = NSRect(x: bounds.midX - 24, y: bounds.midY + 4, width: 48, height: 48)
+        Term.fill.setFill()
+        NSBezierPath(ovalIn: circle).fill()
+        drawSymbol("server.rack", in: circle, pointSize: 19, color: Term.dim)
+        Draw.text(L("No dev servers running", "Geen dev servers actief"), font: termFont(13, .semibold), color: Term.ink,
+                  centeredAt: NSPoint(x: bounds.midX, y: bounds.midY - 12))
+        Draw.text(L("Start one (npm run dev, …) and it shows up here", "Start er een (npm run dev, …) en hij verschijnt hier"),
+                  font: termFont(11, .regular), color: Term.dim, centeredAt: NSPoint(x: bounds.midX, y: bounds.midY - 30))
+    }
+}
+
+final class ListColumn: NSView {
+    override var isFlipped: Bool { true }
+}
+
+// Liquid Glass on macOS 26+, a rounded vibrancy backdrop on older systems.
+final class ChromeView: NSView {
+    private let surface: NSView
+
+    override init(frame frameRect: NSRect) {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = 22
+            surface = glass
+        } else {
+            let blur = NSVisualEffectView()
+            blur.material = .menu
+            blur.blendingMode = .behindWindow
+            blur.state = .active
+            blur.wantsLayer = true
+            blur.layer?.cornerRadius = 14
+            blur.layer?.masksToBounds = true
+            surface = blur
+        }
+        super.init(frame: frameRect)
+        pin(surface, to: self)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func host(_ content: NSView) {
+        if #available(macOS 26.0, *), let glass = surface as? NSGlassEffectView {
+            glass.contentView = content
+        } else {
+            surface.addSubview(content)
+        }
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: surface.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: surface.trailingAnchor),
+            content.topAnchor.constraint(equalTo: surface.topAnchor),
+            content.bottomAnchor.constraint(equalTo: surface.bottomAnchor),
+        ])
+    }
+
+    private func pin(_ view: NSView, to parent: NSView) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        parent.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+            view.topAnchor.constraint(equalTo: parent.topAnchor),
+            view.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
+        ])
+    }
+}
+
+final class MenuPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: Metrics.width, height: 320),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        isFloatingPanel = true
+        level = .popUpMenu
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+        isMovable = false
+        isReleasedWhenClosed = false
+        acceptsMouseMovedEvents = true
+        animationBehavior = .utilityWindow
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+    }
+}
+
+
+final class TabBar: NSView {
+    let titles = [L("Servers", "Servers"), L("Activity", "Activiteit"), L("Storage", "Opslag"), L("Clipboard", "Klembord")]
+    let symbols = ["server.rack", "waveform.path.ecg", "internaldrive", "list.clipboard"]
+    var selected = 0 { didSet { needsDisplay = true } }
+    var onSelect: (Int) -> Void = { _ in }
+    private var hover = -1
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var track: NSRect { bounds.insetBy(dx: Metrics.inset, dy: 5) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = self.track
+        let trackPath = NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2)
+        Term.fill.setFill()
+        trackPath.fill()
+
+        let width = track.width / CGFloat(titles.count)
+        for (index, title) in titles.enumerated() {
+            let rect = NSRect(x: track.minX + CGFloat(index) * width, y: track.minY, width: width, height: track.height)
+            let on = index == selected
+            if on {
+                let pill = rect.insetBy(dx: 3, dy: 3)
+                let path = NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2)
+                NSGraphicsContext.saveGraphicsState()
+                let shadow = NSShadow()
+                shadow.shadowColor = NSColor.black.withAlphaComponent(0.18)
+                shadow.shadowBlurRadius = 4
+                shadow.shadowOffset = NSSize(width: 0, height: -1)
+                shadow.set()
+                NSColor.labelColor.withAlphaComponent(0.14).setFill()
+                path.fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            let face = termFont(12, on ? .semibold : .medium)
+            let color: NSColor = on || index == hover ? Term.ink : Term.dim
+            let textWidth = Draw.width(title, font: face)
+            let total = textWidth + 18
+            let x = rect.midX - total / 2
+            drawSymbol(symbols[index], in: NSRect(x: x, y: rect.minY, width: 13, height: rect.height), pointSize: 11,
+                       weight: on ? .semibold : .medium, color: on ? Term.accent : color)
+            let attrs: [NSAttributedString.Key: Any] = [.font: face, .foregroundColor: color]
+            let height = (title as NSString).size(withAttributes: attrs).height
+            (title as NSString).draw(at: NSPoint(x: x + 18, y: rect.midY - height / 2), withAttributes: attrs)
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let index = index(at: event)
+        guard index != hover else { return }
+        hover = index
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hover = -1
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let index = index(at: event)
+        guard index != selected else { return }
+        selected = index
+        onSelect(index)
+    }
+
+    private func index(at event: NSEvent) -> Int {
+        let x = convert(event.locationInWindow, from: nil).x - track.minX
+        let width = max(1, track.width / CGFloat(titles.count))
+        return min(titles.count - 1, max(0, Int(x / width)))
+    }
+}
+
+// MARK: - Activity
+
+final class Gauge: NSView {
+    private lazy var eased = EasedValues(count: 1, view: self)
+    private let caption: String
+    private let tint: NSColor
+    private var fraction = 0.0
+    private var value = "–"
+    private var detail = ""
+
+    init(caption: String, tint: NSColor) {
+        self.caption = caption
+        self.tint = tint
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func set(fraction: Double, value: String, detail: String) {
+        self.fraction = fraction
+        self.value = value
+        self.detail = detail
+        eased.set([fraction])
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let diameter: CGFloat = min(80, bounds.width - 16)
+        let center = NSPoint(x: bounds.midX, y: bounds.maxY - 8 - diameter / 2)
+        let shown = eased[0]
+        Draw.ring(center: center, radius: diameter / 2 - 5, width: 9, fraction: shown, tint: Draw.level(shown, tint))
+        Draw.text(value, font: roundedFont(18, .bold), color: Term.ink, centeredAt: center)
+        let captionY = bounds.maxY - 8 - diameter - 12
+        Draw.text(caption, font: termFont(12, .semibold), color: Term.ink, centeredAt: NSPoint(x: bounds.midX, y: captionY))
+        if !detail.isEmpty {
+            Draw.text(detail, font: digitFont(10, .regular), color: Term.dim, centeredAt: NSPoint(x: bounds.midX, y: captionY - 15))
+        }
+    }
+}
+
+final class HistoryCard: NSView {
+    private var trace = Trace()
+
+    func set(_ trace: Trace) {
+        self.trace = trace
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        Draw.card(card)
+        Draw.text(L("History", "Verloop"), font: termFont(12, .semibold), color: Term.ink, at: NSPoint(x: card.minX + 14, y: card.maxY - 24))
+
+        var x = card.maxX - 14
+        for (name, color) in [(L("Mem", "Geh."), Term.mem), ("GPU", Term.gpu), ("CPU", Term.cpu)] {
+            let width = Draw.width(name, font: termFont(10, .semibold))
+            x -= width
+            Draw.text(name, font: termFont(10, .semibold), color: Term.dim, at: NSPoint(x: x, y: card.maxY - 23))
+            x -= 10
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x, y: card.maxY - 18, width: 6, height: 6)).fill()
+            x -= 12
+        }
+
+        let plot = NSRect(x: card.minX + 14, y: card.minY + 12, width: card.width - 28, height: card.height - 44)
+        Term.stroke.setFill()
+        for step in 0...2 {
+            NSRect(x: plot.minX, y: plot.minY + plot.height * CGFloat(step) / 2, width: plot.width, height: 1).fill()
+        }
+        Draw.spark(trace.mem, in: plot, tint: Term.mem, lineWidth: 1.4, fill: false, capacity: Trace.capacity)
+        Draw.spark(trace.gpu, in: plot, tint: Term.gpu, lineWidth: 1.4, fill: false, capacity: Trace.capacity)
+        Draw.spark(trace.cpu, in: plot, tint: Term.cpu, lineWidth: 1.8, fill: true, capacity: Trace.capacity)
+    }
+}
+
+final class LoadRow: NSView {
+    let groupID: Int32
+    private let kind: Kind
+    private lazy var eased = EasedValues(count: 1, view: self)
+    private var hot = false
+    private let name: NSTextField
+    private let cpu: NSTextField
+    private let mem: NSTextField
+
+    init(group: ServerGroup, peak: Double) {
+        groupID = group.id
+        kind = Kind.of(group)
+        name = makeLabel(group.title, size: 12, weight: .medium, color: Term.ink)
+        cpu = makeLabel("", size: 12, weight: .semibold, color: Term.ink)
+        cpu.font = roundedFont(12, .semibold)
+        cpu.alignment = .right
+        mem = makeLabel("", size: 11, weight: .medium, color: Term.dim)
+        mem.font = digitFont(11, .medium)
+        mem.alignment = .right
+        super.init(frame: .zero)
+        addSubview(name)
+        addSubview(cpu)
+        addSubview(mem)
+        update(group: group, peak: peak)
+    }
+
+    func update(group: ServerGroup, peak: Double) {
+        hot = group.cpu >= 40
+        cpu.stringValue = Scanner.formatCPU(group.cpu)
+        cpu.textColor = hot ? .systemOrange : Term.ink
+        mem.stringValue = Scanner.formatBytes(group.rss)
+        eased.set([peak > 0 ? group.cpu / peak : 0])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var barRect: NSRect {
+        NSRect(x: name.frame.maxX + 8, y: bounds.midY - 3, width: max(10, cpu.frame.minX - name.frame.maxX - 16), height: 6)
+    }
+
+    override func layout() {
+        super.layout()
+        let right = bounds.width - Metrics.inset - 10
+        mem.frame = NSRect(x: right - 50, y: (bounds.height - 14) / 2, width: 50, height: 14)
+        cpu.frame = NSRect(x: mem.frame.minX - 54, y: (bounds.height - 16) / 2, width: 50, height: 16)
+        name.frame = NSRect(x: Metrics.inset + 40, y: (bounds.height - 16) / 2, width: 128, height: 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Draw.monogram(kind, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 11, width: 22, height: 22))
+        let bar = barRect
+        Term.fill.setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
+        var filled = bar
+        filled.size.width = max(bar.height, bar.width * CGFloat(min(1, max(0, eased[0]))))
+        (hot ? NSColor.systemOrange : Term.cpu).setFill()
+        NSBezierPath(roundedRect: filled, xRadius: 3, yRadius: 3).fill()
+    }
+}
+
+final class ActivityPane: NSView {
+    override var isFlipped: Bool { true }
+    private let cpu = Gauge(caption: "CPU", tint: Term.cpu)
+    private let gpu = Gauge(caption: "GPU", tint: Term.gpu)
+    private let mem = Gauge(caption: L("Memory", "Geheugen"), tint: Term.mem)
+    private let history = HistoryCard()
+    private let section = makeLabel(L("Top processes", "Top processen"), size: 11, weight: .semibold, color: Term.dim)
+    private var loads: [LoadRow] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        for view in [cpu, gpu, mem, history] as [NSView] { addSubview(view) }
+        addSubview(section)
+        section.isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(vitals: Vitals, trace: Trace, groups: [ServerGroup]) {
+        setCharts(vitals, trace)
+        // Rows are kept per server so their bars glide to new values instead of being rebuilt.
+        let peak = max(1, groups.map(\.cpu).max() ?? 0)
+        var existing = Dictionary(loads.map { ($0.groupID, $0) }, uniquingKeysWith: { first, _ in first })
+        loads = groups.sorted { $0.cpu > $1.cpu }.map { group in
+            if let row = existing.removeValue(forKey: group.id) {
+                row.update(group: group, peak: peak)
+                return row
+            }
+            let row = LoadRow(group: group, peak: peak)
+            addSubview(row)
+            return row
+        }
+        existing.values.forEach { $0.removeFromSuperview() }
+        section.isHidden = loads.isEmpty
+        needsLayout = true
+    }
+
+    func setCharts(_ vitals: Vitals, _ trace: Trace) {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        cpu.set(fraction: vitals.cpu / 100, value: "\(Int(vitals.cpu.rounded()))%", detail: "\(cores) " + L("cores", "kernen"))
+        gpu.set(fraction: vitals.gpu / 100, value: "\(Int(vitals.gpu.rounded()))%", detail: L("utilization", "belasting"))
+        let used = vitals.total > 0 ? Double(vitals.used) / Double(vitals.total) : 0
+        mem.set(fraction: used, value: "\(Int((used * 100).rounded()))%",
+                detail: "\(Scanner.formatBytes(vitals.used)) / \(Scanner.formatBytes(vitals.total))")
+        history.set(trace)
+    }
+
+    override func layout() {
+        super.layout()
+        var y = Metrics.listPad
+        let slot = (bounds.width - Metrics.inset * 2) / 3
+        for (index, gauge) in [cpu, gpu, mem].enumerated() {
+            gauge.frame = NSRect(x: Metrics.inset + CGFloat(index) * slot, y: y, width: slot, height: Metrics.gauges)
+        }
+        y += Metrics.gauges
+        history.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.history)
+        y += Metrics.history
+        guard !loads.isEmpty else { return }
+        section.frame = NSRect(x: Metrics.inset + 6, y: y + 10, width: 200, height: 14)
+        y += Metrics.section
+        for row in loads {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.proc)
+            y += Metrics.proc
+        }
+    }
+}
+
+// MARK: - Storage
+
+final class VolumeCard: NSView {
+    private var volume: DiskVolume
+    private lazy var eased = EasedValues(count: 1, view: self)
+
+    init(volume: DiskVolume) {
+        self.volume = volume
+        super.init(frame: .zero)
+        eased.set([volume.fraction])
+    }
+
+    func update(_ volume: DiskVolume) {
+        self.volume = volume
+        eased.set([volume.fraction])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = bounds.insetBy(dx: Metrics.inset, dy: 4)
+        Draw.card(card)
+        let f = volume.fraction
+        let center = NSPoint(x: card.minX + 14 + 28, y: card.midY)
+        Draw.ring(center: center, radius: 25, width: 7, fraction: eased[0], tint: Draw.level(eased[0], Term.disk))
+        Draw.text("\(Int((f * 100).rounded()))%", font: roundedFont(13, .bold), color: Term.ink, centeredAt: center)
+
+        let x = card.minX + 86
+        Draw.text(volume.name, font: termFont(13, .semibold), color: Term.ink, at: NSPoint(x: x, y: card.midY + 3))
+        let free = "\(Scanner.formatBytes(volume.free)) " + L("free of", "vrij van") + " \(Scanner.formatBytes(volume.total))"
+        Draw.text(free, font: digitFont(11, .regular), color: Term.dim, at: NSPoint(x: x, y: card.midY - 15))
+
+        let used = Scanner.formatBytes(volume.used)
+        let usedFont = roundedFont(15, .bold)
+        let usedWidth = Draw.width(used, font: usedFont)
+        Draw.text(used, font: usedFont, color: Draw.level(f, Term.ink), at: NSPoint(x: card.maxX - 16 - usedWidth, y: card.midY + 1))
+        let caption = L("used", "gebruikt")
+        let captionWidth = Draw.width(caption, font: termFont(10, .medium))
+        Draw.text(caption, font: termFont(10, .medium), color: Term.dim, at: NSPoint(x: card.maxX - 16 - captionWidth, y: card.midY - 15))
+    }
+}
+
+final class BinRow: NSView {
+    private let symbol: String
+    private let color: NSColor
+    private let title: NSTextField
+    private let detail: NSTextField
+    private let size: NSTextField
+    private let clear: QuietButton
+
+    static func symbol(for id: String) -> String {
+        switch id {
+        case "caches": return "archivebox.fill"
+        case "homebrew": return "mug.fill"
+        case "xcode": return "hammer.fill"
+        case "logs": return "doc.text.fill"
+        case "trash": return "trash.fill"
+        default: return "folder.fill"
+        }
+    }
+
+    init(bin: CleanBin, color: NSColor, clear clearAction: @escaping () -> Void) {
+        symbol = BinRow.symbol(for: bin.id)
+        self.color = color
+        title = makeLabel(bin.title.prefix(1).uppercased() + bin.title.dropFirst(), size: 12, weight: .semibold, color: Term.ink)
+        detail = makeLabel(bin.detail, size: 10, weight: .regular, color: Term.dim)
+        size = makeLabel(bin.bytes == 0 ? "0" : Scanner.formatBytes(bin.bytes), size: 12, weight: .semibold,
+                         color: bin.bytes == 0 ? Term.dim : Term.ink)
+        size.font = roundedFont(12, .semibold)
+        size.alignment = .right
+        clear = QuietButton(L("Clear", "Leeg")) { clearAction() }
+        super.init(frame: .zero)
+        clear.isHidden = bin.bytes == 0
+        for view in [title, detail, size, clear] as [NSView] { addSubview(view) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        let right = bounds.width - Metrics.inset - 8
+        clear.frame = NSRect(x: right - 54, y: (bounds.height - 24) / 2, width: 54, height: 24)
+        size.frame = NSRect(x: clear.frame.minX - 70, y: (bounds.height - 16) / 2, width: 62, height: 16)
+        let left = Metrics.inset + 48
+        title.frame = NSRect(x: left, y: bounds.height / 2 + 1, width: max(40, size.frame.minX - left - 8), height: 15)
+        detail.frame = NSRect(x: left, y: bounds.height / 2 - 14, width: title.frame.width, height: 13)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Draw.tile(symbol, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 15, width: 30, height: 30), color: color)
+    }
+}
+
+final class StackBar: NSView {
+    private var parts: [(CGFloat, NSColor)] = []
+
+    func set(bins: [CleanBin]) {
+        let total = bins.reduce(UInt64(0)) { $0 + $1.bytes }
+        parts = total == 0 ? [] : bins.enumerated().compactMap { index, bin in
+            guard bin.bytes > 0 else { return nil }
+            return (CGFloat(bin.bytes) / CGFloat(total), Term.bins[index % Term.bins.count])
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bar = bounds.insetBy(dx: Metrics.inset + 4, dy: 6)
+        let shape = NSBezierPath(roundedRect: bar, xRadius: bar.height / 2, yRadius: bar.height / 2)
+        Term.fill.setFill()
+        shape.fill()
+        guard !parts.isEmpty else { return }
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        var x = bar.minX
+        for (fraction, color) in parts {
+            let width = bar.width * fraction
+            color.setFill()
+            NSRect(x: x, y: bar.minY, width: max(0, width - 1.5), height: bar.height).fill()
+            x += width
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+final class StoragePane: NSView {
+    override var isFlipped: Bool { true }
+    var onClear: (CleanBin) -> Void = { _ in }
+    private var rows: [VolumeCard] = []
+    private var bins: [BinRow] = []
+    private let stack = StackBar()
+    private let cleanLabel = makeLabel(L("Clean up", "Opschonen"), size: 11, weight: .semibold, color: Term.dim)
+    private let totalLabel = makeLabel("", size: 11, weight: .semibold, color: Term.ink)
+    private let measuring = makeLabel(L("Measuring folders…", "Mappen meten…"), size: 12, weight: .medium, color: Term.dim)
+    private(set) var volumeCount = 0
+    private(set) var binCount = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        totalLabel.alignment = .right
+        measuring.alignment = .center
+        addSubview(measuring)
+        addSubview(cleanLabel)
+        addSubview(totalLabel)
+        addSubview(stack)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(volumes: [DiskVolume], bins found: [CleanBin]) {
+        if rows.count == volumes.count {
+            zip(rows, volumes).forEach { $0.update($1) }
+        } else {
+            rows.forEach { $0.removeFromSuperview() }
+            rows = volumes.map(VolumeCard.init)
+            rows.forEach(addSubview)
+        }
+        bins.forEach { $0.removeFromSuperview() }
+        bins = found.enumerated().map { index, bin in
+            BinRow(bin: bin, color: Term.bins[index % Term.bins.count]) { [weak self] in self?.onClear(bin) }
+        }
+        bins.forEach(addSubview)
+        stack.set(bins: found)
+        let total = found.reduce(UInt64(0)) { $0 + $1.bytes }
+        totalLabel.stringValue = found.isEmpty ? "" : Scanner.formatBytes(total) + " " + L("reclaimable", "vrij te maken")
+        measuring.isHidden = !found.isEmpty
+        volumeCount = volumes.count
+        binCount = found.count
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        var y = Metrics.listPad
+        for row in rows {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.volume)
+            y += Metrics.volume
+        }
+        if rows.isEmpty { y += Metrics.volume }
+        cleanLabel.frame = NSRect(x: Metrics.inset + 6, y: y + 10, width: 160, height: 14)
+        totalLabel.frame = NSRect(x: bounds.width - Metrics.inset - 6 - 200, y: y + 10, width: 200, height: 14)
+        y += Metrics.section
+        stack.frame = NSRect(x: 0, y: y, width: bounds.width, height: 22)
+        y += 22
+        measuring.frame = NSRect(x: 16, y: y + (Metrics.bin - 16) / 2, width: max(0, bounds.width - 32), height: 16)
+        for row in bins {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.bin)
+            y += Metrics.bin
+        }
+    }
+}
+
+// MARK: - Clipboard
+
+final class ClipRow: HoverView {
+    private let preview: NSTextField
+    private let meta: NSTextField
+    private let pin: IconButton
+    private let pinned: Bool
+    private let symbol: String
+    private let color: NSColor
+
+    init(clip: ClipItem, copy: @escaping () -> Void, toggle: @escaping () -> Void) {
+        let oneLine = clip.text.replacingOccurrences(of: "\n", with: " ")
+        preview = makeLabel(oneLine, size: 12, weight: .medium, color: Term.ink)
+        let when = ClipRow.ago(clip.date)
+        let what: String
+        switch clip.kind {
+        case "link":
+            what = L("Link", "Link"); symbol = "link"; color = .systemBlue
+        case "file":
+            what = L("File", "Bestand"); symbol = "doc.fill"; color = .systemOrange
+        default:
+            what = L("Text", "Tekst"); symbol = "text.alignleft"; color = .systemGray
+        }
+        let who = clip.app.isEmpty ? what : "\(what)  ·  \(clip.app)"
+        meta = makeLabel("\(who)  ·  \(when)", size: 10, weight: .regular, color: Term.dim)
+        pinned = clip.pinned
+        pin = IconButton(symbol: clip.pinned ? "pin.fill" : "pin", help: L("Pin", "Vastzetten"), action: toggle)
+        super.init(frame: .zero)
+        onClick = copy
+        toolTip = clip.text
+        pin.isHidden = !pinned
+        addSubview(preview)
+        addSubview(meta)
+        addSubview(pin)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func refresh() {
+        super.refresh()
+        pin.isHidden = !(pinned || hovered)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !pin.isHidden, pin.frame.contains(local) { return pin }
+        return self
+    }
+
+    override func layout() {
+        super.layout()
+        pin.frame = NSRect(x: bounds.width - Metrics.inset - 36, y: (bounds.height - 26) / 2, width: 28, height: 26)
+        let left = Metrics.inset + 50
+        preview.frame = NSRect(x: left, y: bounds.height / 2 + 1, width: max(40, pin.frame.minX - left - 6), height: 16)
+        meta.frame = NSRect(x: left, y: bounds.height / 2 - 15, width: preview.frame.width, height: 13)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered || pressed {
+            Draw.card(bounds.insetBy(dx: Metrics.inset, dy: 2), hot: true, radius: 12)
+        }
+        Draw.tile(symbol, in: NSRect(x: Metrics.inset + 10, y: bounds.midY - 15, width: 30, height: 30), color: color)
+    }
+
+    private static func ago(_ date: Date) -> String {
+        let minutes = Int(Date().timeIntervalSince(date) / 60)
+        if minutes < 1 { return L("just now", "zojuist") }
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        if hours < 48 { return "\(hours)\(L("h", "u"))" }
+        return "\(hours / 24)d"
+    }
+}
+
+final class ClipPane: NSView, NSTextFieldDelegate {
+    override var isFlipped: Bool { true }
+    var onCopy: (ClipItem) -> Void = { _ in }
+    var onPin: (ClipItem) -> Void = { _ in }
+    var onFilter: () -> Void = {}
+    private let field = NSTextField()
+    private let empty = makeLabel(L("Clipboard is empty", "Klembord is leeg"), size: 13, weight: .semibold, color: Term.dim)
+    private var all: [ClipItem] = []
+    private var rows: [ClipRow] = []
+    private(set) var shown = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = termFont(12, .medium)
+        field.textColor = Term.ink
+        field.placeholderString = L("Search clipboard", "Zoek in klembord")
+        field.delegate = self
+        empty.alignment = .center
+        empty.isHidden = true
+        addSubview(field)
+        addSubview(empty)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ clips: [ClipItem]) {
+        all = clips
+        rebuild()
+    }
+
+    @objc func controlTextDidChange(_ obj: Notification) {
+        rebuild()
+        onFilter()
+    }
+
+    func takeQuery(_ extra: String) -> Bool {
+        window?.makeFirstResponder(field)
+        field.stringValue += extra
+        rebuild()
+        onFilter()
+        return true
+    }
+
+    func clearQuery() -> Bool {
+        guard !field.stringValue.isEmpty else { return false }
+        field.stringValue = ""
+        rebuild()
+        onFilter()
+        return true
+    }
+
+    var isEditing: Bool { window?.firstResponder === field.currentEditor() }
+
+    private func rebuild() {
+        rows.forEach { $0.removeFromSuperview() }
+        let query = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let shownItems = query.isEmpty ? all : all.filter {
+            $0.text.lowercased().contains(query) || $0.app.lowercased().contains(query) || $0.kind.contains(query)
+        }
+        rows = shownItems.map { clip in
+            ClipRow(clip: clip, copy: { [weak self] in self?.onCopy(clip) }, toggle: { [weak self] in self?.onPin(clip) })
+        }
+        rows.forEach(addSubview)
+        shown = shownItems.count
+        empty.isHidden = shown != 0
+        needsLayout = true
+    }
+
+    private var searchRect: NSRect { NSRect(x: Metrics.inset, y: 6, width: bounds.width - Metrics.inset * 2, height: 30) }
+
+    override func layout() {
+        super.layout()
+        let search = searchRect
+        field.frame = NSRect(x: search.minX + 32, y: search.minY + 7, width: search.width - 44, height: 17)
+        empty.frame = NSRect(x: 16, y: 64, width: max(0, bounds.width - 32), height: 16)
+        var y: CGFloat = 46
+        for row in rows {
+            row.frame = NSRect(x: 0, y: y, width: bounds.width, height: Metrics.clip)
+            y += Metrics.clip
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let search = searchRect
+        let path = NSBezierPath(roundedRect: search, xRadius: search.height / 2, yRadius: search.height / 2)
+        Term.fill.setFill()
+        path.fill()
+        drawSymbol("magnifyingglass", in: NSRect(x: search.minX + 10, y: search.minY, width: 16, height: search.height),
+                   pointSize: 12, weight: .semibold, color: Term.dim)
+    }
+}
+
+// MARK: - Board
+
+final class BoardView: NSView {
+    var openURL: (String) -> Void = { _ in }
+    var copyText: (String) -> Void = { _ in }
+    var reveal: (String) -> Void = { _ in }
+    var terminal: (String) -> Void = { _ in }
+    var stop: (Int32) -> Void = { _ in }
+    var setApps: (Bool) -> Void = { _ in }
+    var setLogin: (Bool) -> Void = { _ in }
+    var quit: () -> Void = {}
+    var onPage: () -> Void = {}
+    var relayout: () -> Void = {}
+    var clearBin: (CleanBin) -> Void = { _ in }
+    var copyClip: (ClipItem) -> Void = { _ in }
+    var pinClip: (ClipItem) -> Void = { _ in }
+    private(set) var page = 0
+    private var trace = Trace()
+
+    private let hero = HeroView()
+    private let tabs = TabBar()
+    private let well = NSView()
+    private let scroll = NSScrollView()
+    private let column = ListColumn()
+    private let empty = EmptyState()
+    private let activityScroll = NSScrollView()
+    private let activity = ActivityPane()
+    private let storageScroll = NSScrollView()
+    private let storage = StoragePane()
+    private let clipScroll = NSScrollView()
+    private let clips = ClipPane()
+    private let footer = NSView()
+    private let hairline = NSView()
+    private let appsToggle = TogglePill(L("Apps", "Apps"), symbol: "square.grid.2x2.fill",
+                                        help: L("Also show regular apps that listen on a port", "Toon ook gewone apps die op een poort luisteren"))
+    private let loginToggle = TogglePill(L("Login", "Login"), symbol: "power",
+                                         help: L("Launch iServer at login", "Open iServer bij inloggen"))
+    private var quitButton: IconButton!
+    private var rows: [ServerCard] = []
+    private var pendingScroll: NSPoint?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        appsToggle.onChange = { [weak self] on in self?.setApps(on) }
+        loginToggle.onChange = { [weak self] on in self?.setLogin(on) }
+        quitButton = IconButton(symbol: "xmark.circle", help: L("Quit iServer", "Stop iServer")) { [weak self] in self?.quit() }
+
+        tabs.onSelect = { [weak self] index in
+            guard let self else { return }
+            self.page = index
+            self.applyPage()
+            self.fadeInPage()
+            self.onPage()
+        }
+        hairline.wantsLayer = true
+        hairline.layer?.backgroundColor = Term.line.cgColor
+        footer.addSubview(hairline)
+        footer.addSubview(appsToggle)
+        footer.addSubview(loginToggle)
+        footer.addSubview(quitButton)
+
+        configure(scroll)
+        scroll.documentView = column
+        configure(activityScroll)
+        activityScroll.documentView = activity
+        configure(storageScroll)
+        storageScroll.documentView = storage
+        configure(clipScroll)
+        clipScroll.documentView = clips
+        storage.onClear = { [weak self] in self?.clearBin($0) }
+        clips.onCopy = { [weak self] in self?.copyClip($0) }
+        clips.onPin = { [weak self] in self?.pinClip($0) }
+        clips.onFilter = { [weak self] in self?.relayout() }
+        for view in [scroll, empty, activityScroll, storageScroll, clipScroll] as [NSView] { well.addSubview(view) }
+
+        addSubview(hero)
+        addSubview(tabs)
+        addSubview(well)
+        addSubview(footer)
+
+        for view in [hero, tabs, well, scroll, empty, activityScroll, storageScroll, clipScroll, footer] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+        var constraints: [NSLayoutConstraint] = [
+            hero.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            hero.leadingAnchor.constraint(equalTo: leadingAnchor),
+            hero.trailingAnchor.constraint(equalTo: trailingAnchor),
+            hero.heightAnchor.constraint(equalToConstant: Metrics.hero - 4),
+
+            tabs.topAnchor.constraint(equalTo: hero.bottomAnchor),
+            tabs.leadingAnchor.constraint(equalTo: leadingAnchor),
+            tabs.trailingAnchor.constraint(equalTo: trailingAnchor),
+            tabs.heightAnchor.constraint(equalToConstant: Metrics.tabs),
+
+            footer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: Metrics.footer),
+
+            well.topAnchor.constraint(equalTo: tabs.bottomAnchor),
+            well.leadingAnchor.constraint(equalTo: leadingAnchor),
+            well.trailingAnchor.constraint(equalTo: trailingAnchor),
+            well.bottomAnchor.constraint(equalTo: footer.topAnchor),
+        ]
+        for view in [scroll, empty, activityScroll, storageScroll, clipScroll] as [NSView] {
+            constraints += [
+                view.topAnchor.constraint(equalTo: well.topAnchor),
+                view.leadingAnchor.constraint(equalTo: well.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: well.trailingAnchor),
+                view.bottomAnchor.constraint(equalTo: well.bottomAnchor),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
+
+        let names = ["server": 0, "servers": 0, "activity": 1, "activiteit": 1, "storage": 2, "opslag": 2, "clipboard": 3, "klembord": 3]
+        if let index = CommandLine.arguments.firstIndex(of: "--tab"),
+           index + 1 < CommandLine.arguments.count,
+           let found = names[CommandLine.arguments[index + 1]] {
+            page = found
+            tabs.selected = found
+        }
+        applyPage()
+    }
+
+    private func configure(_ scroll: NSScrollView) {
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.automaticallyAdjustsContentInsets = false
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setToggles(apps: Bool, login: Bool) {
+        appsToggle.checked = apps
+        loginToggle.checked = login
+    }
+
+    func setHero(groups: [ServerGroup], vitals: Vitals, disk: DiskVolume?) {
+        hero.set(groups: groups, vitals: vitals, disk: disk)
+    }
+
+    func update(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume], bins: [CleanBin],
+                includeApps: Bool, login: Bool, lan: String?) {
+        pendingScroll = scroll.contentView.bounds.origin
+        let known = Set(rows.map(\.groupID))
+        rows.forEach { $0.removeFromSuperview() }
+        rows = groups.map { group in
+            ServerCard(group: group, history: history[group.id] ?? [], lan: lan, openURL: openURL, copyText: copyText,
+                       reveal: reveal, terminal: terminal) { [weak self] in
+                self?.stop(group.id)
+            }
+        }
+        rows.forEach(column.addSubview)
+        // Servers that just appeared fade in; the rest stay put.
+        if !known.isEmpty {
+            for row in rows where !known.contains(row.groupID) {
+                row.alphaValue = 0
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.35
+                    row.animator().alphaValue = 1
+                }
+            }
+        }
+        setHero(groups: groups, vitals: vitals, disk: volumes.first)
+        if page == 1 { activity.show(vitals: vitals, trace: trace, groups: groups) }
+        if page == 2 { storage.show(volumes: volumes, bins: bins) }
+        setToggles(apps: includeApps, login: login)
+        applyPage()
+        needsLayout = true
+    }
+
+    func refreshStats(groups: [ServerGroup], history: [Int32: [Double]], vitals: Vitals, volumes: [DiskVolume], bins: [CleanBin]) {
+        setHero(groups: groups, vitals: vitals, disk: volumes.first)
+        switch page {
+        case 1:
+            activity.show(vitals: vitals, trace: trace, groups: groups)
+        case 2:
+            storage.show(volumes: volumes, bins: bins)
+        default:
+            for group in groups {
+                rows.first { $0.groupID == group.id }?.applyStats(group, history: history[group.id] ?? [])
+            }
+        }
+        needsLayout = true
+    }
+
+    func bodyHeight(maxHeight: CGFloat) -> CGFloat {
+        switch page {
+        case 1: return Metrics.capped(Metrics.activityHeight(count: rows.count), maxHeight: maxHeight)
+        case 2: return Metrics.capped(Metrics.storageHeight(volumes: storage.volumeCount, bins: storage.binCount), maxHeight: maxHeight)
+        case 3: return Metrics.capped(Metrics.clipHeight(count: clips.shown), maxHeight: maxHeight)
+        default: return Metrics.listHeight(count: rows.count, maxHeight: maxHeight)
+        }
+    }
+
+    func noteCharts(_ vitals: Vitals, _ trace: Trace) {
+        self.trace = trace
+        guard page == 1 else { return }
+        activity.setCharts(vitals, trace)
+    }
+
+    func showClips(_ items: [ClipItem]) {
+        clips.show(items)
+        needsLayout = true
+    }
+
+    func showStorage(volumes: [DiskVolume], bins: [CleanBin]) {
+        storage.show(volumes: volumes, bins: bins)
+        needsLayout = true
+    }
+
+    func clearClipFilter() -> Bool { clips.clearQuery() }
+    func clipIsEditing() -> Bool { clips.isEditing }
+    func typeClip(_ text: String) { _ = clips.takeQuery(text) }
+
+    private var pageView: NSView {
+        switch page {
+        case 1: return activityScroll
+        case 2: return storageScroll
+        case 3: return clipScroll
+        default: return rows.isEmpty ? empty : scroll
+        }
+    }
+
+    private func fadeInPage() {
+        let view = pageView
+        view.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            view.animator().alphaValue = 1
+        }
+    }
+
+    // Cards cascade in when the panel opens.
+    func animateIn() {
+        fadeInPage()
+        guard page == 0 else { return }
+        for (index, row) in rows.enumerated() {
+            row.alphaValue = 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03 * Double(index)) {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.25
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    row.animator().alphaValue = 1
+                }
+            }
+        }
+    }
+
+    private func applyPage() {
+        let servers = page == 0
+        let hasRows = !rows.isEmpty
+        scroll.isHidden = !servers || !hasRows
+        empty.isHidden = !servers || hasRows
+        activityScroll.isHidden = page != 1
+        storageScroll.isHidden = page != 2
+        clipScroll.isHidden = page != 3
+    }
+
+    override func layout() {
+        super.layout()
+        let width = max(scroll.contentView.bounds.width, well.bounds.width)
+        guard width > 1 else { return }
+        var y = Metrics.listPad
+        for row in rows {
+            row.frame = NSRect(x: 0, y: y, width: width, height: Metrics.row)
+            y += Metrics.row
+        }
+        if !rows.isEmpty { y += Metrics.listPad }
+        let next = NSRect(x: 0, y: 0, width: width, height: max(y, 1))
+        if column.frame.integral != next.integral { column.frame = next }
+        if let point = pendingScroll {
+            pendingScroll = nil
+            scroll.contentView.scroll(to: point)
+        }
+
+        let activityFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.activityHeight(count: rows.count))
+        if activity.frame.integral != activityFrame.integral { activity.frame = activityFrame }
+        let storageFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.storageHeight(volumes: storage.volumeCount, bins: max(storage.binCount, 1)))
+        if storage.frame.integral != storageFrame.integral { storage.frame = storageFrame }
+        let clipFrame = NSRect(x: 0, y: 0, width: width, height: Metrics.clipHeight(count: clips.shown))
+        if clips.frame.integral != clipFrame.integral { clips.frame = clipFrame }
+
+        let w = footer.bounds.width
+        let h = footer.bounds.height
+        hairline.frame = NSRect(x: Metrics.inset + 6, y: h - 1, width: w - Metrics.inset * 2 - 12, height: 1)
+        let pill: CGFloat = 26
+        appsToggle.frame = NSRect(x: Metrics.inset, y: (h - pill) / 2, width: appsToggle.preferredWidth, height: pill)
+        loginToggle.frame = NSRect(x: appsToggle.frame.maxX + 6, y: (h - pill) / 2, width: loginToggle.preferredWidth, height: pill)
+        quitButton.frame = NSRect(x: w - Metrics.inset - 30, y: (h - pill) / 2, width: 30, height: pill)
+    }
+}
+
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let menu = NSMenu()
+    private let panel = MenuPanel()
+    private let board = BoardView()
     private let demo = CommandLine.arguments.contains("--demo")
     private var groups: [ServerGroup] = []
+    private var vitals = Vitals.empty
+    private var volumes: [DiskVolume] = []
+    private var bins: [CleanBin] = []
+    private var sizing = false
+    private let clips = ClipBook()
     private var lastSignature = ""
     private var scanning = false
+    private var junkAt: TimeInterval = 0
+    private var rescanJunk = false
+    private var trace = Trace()
+    private var cpuHistory: [Int32: [Double]] = [:]  // per server group, newest last
+    private var menuCPU: [Double] = []  // system CPU 0...1 for the menu bar graph, newest last
+    private var chartTimer: Timer?
+    private var charting = false
     private var timer: Timer?
+    private var monitors: [Any] = []
+    private var openedAt: TimeInterval = 0
+    private var suppressOpenUntil: TimeInterval = 0
 
     private var includeApps: Bool {
         get { UserDefaults.standard.bool(forKey: "includeApps") }
@@ -295,26 +2539,175 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        menu.delegate = self
-        menu.autoenablesItems = false
-        statusItem.menu = menu
-        statusItem.button?.imagePosition = .imageLeading
+        let chrome = ChromeView()
+        panel.contentView = chrome
+        panel.delegate = self
+        chrome.host(board)
+        board.openURL = { [weak self] in self?.openURL($0) }
+        board.copyText = { [weak self] in self?.copyText($0) }
+        board.reveal = { [weak self] in self?.revealFolder($0) }
+        board.terminal = { [weak self] in self?.openTerminal($0) }
+        board.stop = { [weak self] in self?.stopGroup($0) }
+        board.setApps = { [weak self] in self?.setIncludeApps($0) }
+        board.setLogin = { [weak self] in self?.setLogin($0) }
+        board.quit = { NSApp.terminate(nil) }
+        board.relayout = { [weak self] in self?.placePanel(animated: true) }
+        board.onPage = { [weak self] in
+            guard let self else { return }
+            self.placePanel(animated: true)
+            self.board.refreshStats(groups: self.groups, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes, bins: self.bins)
+            self.setChartsRunning(self.board.page == 1)
+            if self.board.page == 1 { self.refresh() }
+            if self.board.page == 2 {
+                self.refresh()
+                self.scanJunk(force: false)
+            }
+        }
+        board.clearBin = { [weak self] in self?.clearBin($0) }
+        board.copyClip = { [weak self] item in
+            self?.clips.copy(item)
+            self?.closePanel()
+        }
+        board.pinClip = { [weak self] in self?.clips.togglePin($0.id) }
+        clips.onChange = { [weak self] in
+            guard let self else { return }
+            self.board.showClips(self.clips.items)
+            if self.panel.isVisible, self.board.page == 3 { self.placePanel(animated: true) }
+        }
+        board.showClips(clips.items)
+
+        if let button = statusItem.button {
+            button.imagePosition = .imageLeading
+            button.target = self
+            button.action = #selector(togglePanel)
+            button.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            guard let self, self.panel.isVisible else { return event }
+            if event.keyCode == 53 {
+                if self.board.clearClipFilter() { return nil }
+                self.closePanel()
+                return nil
+            }
+            guard self.board.page == 3, !self.board.clipIsEditing(),
+                  event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  let chars = event.characters, chars.count == 1,
+                  let scalar = chars.unicodeScalars.first, scalar.value >= 32, scalar.value < 0xF700
+            else { return event }
+            self.board.typeClip(chars)
+            return nil
+        }) { monitors.append(local) }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+            self?.closePanel()
+        }) { monitors.append(global) }
+
         updateButton()
-        rebuildMenu()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
-        timer?.tolerance = 1
+        scheduleRefresh()
+        let clipTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.clips.poll() }
+        clipTimer.tolerance = 1
+        let cpuTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.sampleMenuCPU() }
+        cpuTimer.tolerance = 0.5
+        sampleMenuCPU()
         if CommandLine.arguments.contains("--open-menu") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                NSApp.activate(ignoringOtherApps: true)
-                self.statusItem.button?.performClick(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.openPanel()
             }
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
-        rebuildMenu()
+    func windowDidResignKey(_ notification: Notification) {
+        guard ProcessInfo.processInfo.systemUptime - openedAt > 0.25 else { return }
+        closePanel()
+    }
+
+    @objc private func togglePanel() {
+        if panel.isVisible {
+            closePanel()
+            return
+        }
+        if ProcessInfo.processInfo.systemUptime < suppressOpenUntil { return }
+        openPanel()
+    }
+
+    private func openPanel() {
+        openedAt = ProcessInfo.processInfo.systemUptime
+        render()
+        placePanel(animated: false)
+        board.animateIn()
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        statusItem.button?.highlight(true)
+        scheduleRefresh()
+        setChartsRunning(board.page == 1)
         refresh()
+    }
+
+    private func closePanel() {
+        guard panel.isVisible else { return }
+        suppressOpenUntil = ProcessInfo.processInfo.systemUptime + 0.25
+        panel.orderOut(nil)
+        statusItem.button?.highlight(false)
+        setChartsRunning(false)
+        scheduleRefresh()
+    }
+
+    private func setChartsRunning(_ on: Bool) {
+        guard on else {
+            chartTimer?.invalidate()
+            chartTimer = nil
+            return
+        }
+        guard chartTimer == nil else { return }
+        tickChart()
+        chartTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in self?.tickChart() }
+        chartTimer?.tolerance = 0.4
+    }
+
+    private func tickChart() {
+        guard panel.isVisible, board.page == 1, !charting else { return }
+        charting = true
+        DispatchQueue.global(qos: .utility).async {
+            let vitals = Vitals.sample()
+            DispatchQueue.main.async {
+                self.charting = false
+                guard self.panel.isVisible, self.board.page == 1 else { return }
+                self.vitals = vitals
+                self.trace.push(Vitals.fraction(of: vitals))
+                self.board.noteCharts(vitals, self.trace)
+            }
+        }
+    }
+
+    private func scheduleRefresh() {
+        timer?.invalidate()
+        let open = panel.isVisible
+        timer = Timer.scheduledTimer(withTimeInterval: open ? 8 : 30, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        timer?.tolerance = open ? 2 : 15
+    }
+
+    private func placePanel(animated: Bool) {
+        guard let button = statusItem.button, let window = button.window else { return }
+        let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = window.screen ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let height = Metrics.chrome + board.bodyHeight(maxHeight: visible.height - 12)
+        var x = round(rect.midX - Metrics.width / 2)
+        x = min(max(x, visible.minX + 8), visible.maxX - Metrics.width - 8)
+        let y = round(rect.minY - 4 - height)
+        let frame = NSRect(x: x, y: max(y, visible.minY + 8), width: Metrics.width, height: height)
+        guard frame.integral != panel.frame.integral else { return }
+        if animated && panel.isVisible {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().setFrame(frame, display: true)
+            }
+        } else {
+            panel.setFrame(frame, display: true, animate: false)
+        }
     }
 
     @objc private func refresh() {
@@ -322,167 +2715,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         scanning = true
         let includeApps = self.includeApps
         let demo = self.demo
-        DispatchQueue.global(qos: .utility).async {
+        let visible = panel.isVisible
+        let qos: DispatchQoS.QoSClass = visible ? .utility : .background
+        DispatchQueue.global(qos: qos).async {
             let result = demo ? Demo.groups() : Scanner.scan(includeApps: includeApps)
+            // The hero strip shows CPU, RAM and disk on every tab, so sample them whenever the panel is open.
+            let vitals = visible ? Vitals.sample() : nil
+            let volumes = visible ? Disks.mounted() : nil
             DispatchQueue.main.async {
                 self.scanning = false
                 self.groups = result
+                self.recordHistory(result)
+                if let vitals {
+                    self.vitals = vitals
+                    self.trace.push(Vitals.fraction(of: vitals))
+                    self.board.noteCharts(vitals, self.trace)
+                }
+                if let volumes { self.volumes = volumes }
+                // Uptime and load are not part of the signature: refreshStats updates those in place.
                 let signature = result.map(\.signature).joined(separator: ";")
-                if signature != self.lastSignature {
+                let changed = signature != self.lastSignature
+                if changed {
                     self.lastSignature = signature
                     self.updateButton()
-                    self.rebuildMenu()
+                }
+                guard self.panel.isVisible else { return }
+                if changed {
+                    self.render()
+                } else {
+                    self.board.refreshStats(groups: result, history: self.cpuHistory, vitals: self.vitals, volumes: self.volumes, bins: self.bins)
+                }
+                // This scan started while the panel was closed, so it has no system stats yet.
+                if vitals == nil {
+                    self.refresh()
                 }
             }
         }
     }
 
+    private func sampleMenuCPU() {
+        DispatchQueue.global(qos: .utility).async {
+            let load = Vitals.cpuLoad() / 100
+            DispatchQueue.main.async {
+                self.menuCPU = Array((self.menuCPU + [load]).suffix(StatusIcon.bars))
+                self.updateButton()
+            }
+        }
+    }
+
+    private func recordHistory(_ groups: [ServerGroup]) {
+        var next: [Int32: [Double]] = [:]
+        for group in groups {
+            next[group.id] = Array(((cpuHistory[group.id] ?? []) + [group.cpu]).suffix(20))
+        }
+        cpuHistory = next
+    }
+
     private func updateButton() {
         guard let button = statusItem.button else { return }
-        let image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Dev servers")
-        image?.isTemplate = true
-        button.image = image
-        button.title = groups.isEmpty ? "" : " \(groups.count)"
-        button.appearsDisabled = groups.isEmpty
+        button.title = ""
+        button.image = StatusIcon.image(cpu: menuCPU)
         button.toolTip = groups.isEmpty
             ? L("No dev servers running", "Geen dev servers actief")
             : groups.map { "\($0.title)  " + $0.listeners.map { ":\($0.port)" }.joined(separator: " ") }.joined(separator: "\n")
     }
 
-    private func rebuildMenu() {
-        menu.removeAllItems()
-
-        let count = groups.count
-        let header = NSMenuItem(
-            title: count == 0 ? L("No dev servers running", "Geen dev servers actief")
-                : L("\(count) dev server\(count == 1 ? "" : "s") running",
-                    "\(count) dev server\(count == 1 ? "" : "s") actief"),
-            action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        if count > 0 { menu.addItem(.separator()) }
-
+    private func render() {
         let lan = demo ? "192.168.1.20" : Scanner.lanAddress()
-        for group in groups {
-            let item = NSMenuItem(title: group.title, action: nil, keyEquivalent: "")
-            let title = NSMutableAttributedString(
-                string: "● ", attributes: [.font: NSFont.menuFont(ofSize: 0),
-                                           .foregroundColor: group.exposed ? NSColor.systemOrange : NSColor.systemGreen])
-            title.append(NSAttributedString(string: group.title, attributes: [.font: NSFont.menuFont(ofSize: 0)]))
-            let ports = "   " + group.listeners.map { ":\($0.port)" }.joined(separator: " ")
-            title.append(NSAttributedString(
-                string: ports,
-                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .regular),
-                             .foregroundColor: NSColor.secondaryLabelColor]))
-            item.attributedTitle = title
-            item.toolTip = group.exposed
-                ? L("Reachable from your network", "Bereikbaar via het netwerk")
-                : L("Local only", "Alleen lokaal bereikbaar")
-            item.submenu = submenu(for: group, lan: lan)
-            menu.addItem(item)
-        }
-
-        menu.addItem(.separator())
-        let appsItem = NSMenuItem(title: L("Show apps too", "Toon ook apps"), action: #selector(toggleApps), keyEquivalent: "")
-        appsItem.state = includeApps ? .on : .off
-        appsItem.target = self
-        menu.addItem(appsItem)
-
-        let loginItem = NSMenuItem(title: L("Launch at login", "Open bij inloggen"), action: #selector(toggleLogin), keyEquivalent: "")
-        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        loginItem.target = self
-        menu.addItem(loginItem)
-
-        menu.addItem(.separator())
-        menu.addItem(withTitle: L("Quit iServer", "Stop iServer"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        board.update(
+            groups: groups,
+            history: cpuHistory,
+            vitals: vitals,
+            volumes: volumes,
+            bins: bins,
+            includeApps: includeApps,
+            login: SMAppService.mainApp.status == .enabled,
+            lan: lan)
+        if panel.isVisible { placePanel(animated: true) }
     }
 
-    private func submenu(for group: ServerGroup, lan: String?) -> NSMenu {
-        let sub = NSMenu()
-        sub.autoenablesItems = false
-
-        let info = NSMenuItem(title: group.detail, action: nil, keyEquivalent: "")
-        info.isEnabled = false
-        sub.addItem(info)
-        sub.addItem(.separator())
-
-        for listener in group.listeners {
-            if Scanner.isHTTP(listener, in: group) {
-                sub.addItem(actionItem(L("Open", "Open") + " http://localhost:\(listener.port)", #selector(openURL(_:)),
-                                       "http://localhost:\(listener.port)", symbol: "safari"))
-                if listener.exposed, let lan {
-                    sub.addItem(actionItem(L("Open", "Open") + " http://\(lan):\(listener.port)  " + L("(network)", "(netwerk)"),
-                                           #selector(openURL(_:)), "http://\(lan):\(listener.port)", symbol: "network"))
-                }
-            } else {
-                sub.addItem(actionItem(L("Copy", "Kopieer") + " localhost:\(listener.port)", #selector(copyText(_:)),
-                                       "localhost:\(listener.port)", symbol: "doc.on.doc"))
-            }
-        }
-
-        sub.addItem(.separator())
-        for proc in group.processes.prefix(12) {
-            let ports = proc.listeners.map { ":\($0.port)" }.joined(separator: " ")
-            let line = NSMenuItem(
-                title: "\(proc.execName)  ·  pid \(proc.pid)  ·  \(Scanner.formatElapsed(proc.elapsed))  ·  \(ports)",
-                action: nil, keyEquivalent: "")
-            line.isEnabled = false
-            line.toolTip = proc.args
-            sub.addItem(line)
-        }
-        if group.processes.count > 12 {
-            let rest = group.processes.count - 12
-            let more = NSMenuItem(title: L("… and \(rest) more processes", "… en nog \(rest) processen"), action: nil, keyEquivalent: "")
-            more.isEnabled = false
-            sub.addItem(more)
-        }
-
-        sub.addItem(.separator())
-        if let folder = group.folder {
-            sub.addItem(actionItem(L("Show in Finder", "Toon in Finder"), #selector(revealFolder(_:)), folder, symbol: "folder"))
-            sub.addItem(actionItem(L("Open Terminal here", "Open Terminal hier"), #selector(openTerminal(_:)), folder, symbol: "terminal"))
-        }
-        sub.addItem(actionItem(L("Stop server…", "Stop server…"), #selector(stopGroup(_:)), String(group.id), symbol: "stop.circle"))
-        return sub
-    }
-
-    private func actionItem(_ title: String, _ action: Selector, _ payload: String, symbol: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
-        item.representedObject = payload
-        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        return item
-    }
-
-    // MARK: Actions
-
-    @objc private func openURL(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String, let url = URL(string: s) else { return }
+    private func openURL(_ string: String) {
+        guard let url = URL(string: string) else { return }
+        closePanel()
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func copyText(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(s, forType: .string)
+    private func copyText(_ string: String) {
+        clips.copyString(string)
     }
 
-    @objc private func revealFolder(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
+    private func scanJunk(force: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - junkAt > 90 else { return }
+        guard !sizing else {
+            // A scan is already running; run a fresh one after it so its stale sizes don't win.
+            if force { rescanJunk = true }
+            return
+        }
+        sizing = true
+        junkAt = now
+        DispatchQueue.global(qos: .utility).async {
+            let found = Junk.scan()
+            DispatchQueue.main.async {
+                self.sizing = false
+                if self.rescanJunk {
+                    self.rescanJunk = false
+                    self.scanJunk(force: true)
+                    return
+                }
+                self.bins = found
+                guard self.panel.isVisible, self.board.page == 2 else { return }
+                self.board.showStorage(volumes: self.volumes, bins: found)
+                self.placePanel(animated: true)
+            }
+        }
+    }
+
+    private func clearBin(_ bin: CleanBin) {
+        closePanel()
+        let alert = NSAlert()
+        alert.messageText = L("Clear \(bin.title)?", "\(bin.title) legen?")
+        alert.informativeText = bin.id == "trash"
+            ? L("Empties the Trash. This cannot be undone.", "Leegt de prullenmand. Dit kan niet ongedaan worden.")
+            : L("Deletes everything in \(bin.detail). Apps can rebuild caches and logs.",
+               "Verwijdert alles in \(bin.detail). Apps kunnen caches en logs opnieuw maken.")
+        alert.addButton(withTitle: L("Clear", "Leeg"))
+        alert.addButton(withTitle: L("Cancel", "Annuleer"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DispatchQueue.global(qos: .utility).async {
+            Junk.empty(bin)
+            DispatchQueue.main.async {
+                self.scanJunk(force: true)
+            }
+        }
+    }
+
+    private func revealFolder(_ path: String) {
+        closePanel()
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
-    @objc private func openTerminal(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String,
-              let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
-        else { return }
+    private func openTerminal(_ path: String) {
+        guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { return }
+        closePanel()
         NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: terminal,
                                 configuration: NSWorkspace.OpenConfiguration())
     }
 
-    @objc private func stopGroup(_ sender: NSMenuItem) {
-        guard let idString = sender.representedObject as? String, let id = Int32(idString),
-              let group = groups.first(where: { $0.id == id }) else { return }
+    private func stopGroup(_ id: Int32) {
+        guard let group = groups.first(where: { $0.id == id }) else { return }
+        closePanel()
         let n = group.processes.count
         let list = group.processes.prefix(6).map { "\($0.execName) \($0.pid)" }.joined(separator: ", ") + (n > 6 ? ", …" : "")
         let alert = NSAlert()
@@ -493,29 +2876,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: L("Cancel", "Annuleer"))
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn, !demo else { return }
-        for proc in group.processes { kill(proc.pid, SIGTERM) }
+        // The scan can be up to 30s old; only signal PIDs still running the same executable,
+        // so a reused PID never hits an unrelated process.
+        for proc in group.processes where !proc.execPath.isEmpty && Scanner.execPath(proc.pid) == proc.execPath {
+            kill(proc.pid, SIGTERM)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refresh() }
     }
 
-    @objc private func toggleApps() {
-        includeApps.toggle()
+    private func setIncludeApps(_ on: Bool) {
+        includeApps = on
         lastSignature = ""
         refresh()
     }
 
-    @objc private func toggleLogin() {
+    private func setLogin(_ on: Bool) {
         do {
-            if SMAppService.mainApp.status == .enabled {
+            if on {
+                if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
+            } else if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
             }
         } catch {
             let alert = NSAlert(error: error)
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
         }
-        rebuildMenu()
+        board.setToggles(apps: includeApps, login: SMAppService.mainApp.status == .enabled)
     }
 }
 
@@ -526,7 +2913,8 @@ if CommandLine.arguments.contains("--list") {
     for g in groups {
         print("\(g.exposed ? "🟠" : "🟢") \(g.title)  " + g.listeners.map { ":\($0.port)\($0.exposed ? "*" : "")" }.joined(separator: " "))
         print("   \(g.detail)")
-        for p in g.processes { print("   - \(p.execName) pid \(p.pid) · \(Scanner.formatElapsed(p.elapsed))") }
+        print("   \(Scanner.formatCPU(g.cpu))  \(Scanner.formatBytes(g.rss))")
+        for p in g.processes { print("   - \(p.execName) pid \(p.pid) · \(Scanner.formatCPU(p.cpu)) · \(Scanner.formatBytes(p.rss)) · \(Scanner.formatElapsed(p.elapsed))") }
     }
     exit(0)
 }
